@@ -67,7 +67,8 @@ from homeassistant.util.color import (
 )
 
 from .miot.common import (
-    brightness_for_on_with_bright, find_on_with_bright_prop)
+    brightness_for_turn_on, find_on_with_bright_prop,
+    light_turns_on_by_brightness)
 from .miot.miot_spec import MIoTSpecProperty, MIoTSpecService
 from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
@@ -271,10 +272,11 @@ class Light(MIoTServiceEntity, LightEntity):
         if ATTR_BRIGHTNESS in kwargs and self._prop_brightness:
             brightness = brightness_to_value(
                 self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
-        used_on_with_bright = False
+        spec_name = getattr(self.entity_data.spec, 'name', None)
+        used_brightness_on = False
         if self._prop_on_with_bright:
             value_range = self._prop_on_with_bright.value_range
-            value = brightness_for_on_with_bright(
+            value = brightness_for_turn_on(
                 requested=brightness,
                 current=self.get_prop_value(prop=self._prop_brightness),
                 min_value=value_range.min_ if value_range else None,
@@ -282,7 +284,7 @@ class Light(MIoTServiceEntity, LightEntity):
             await self.set_property_async(
                 prop=self._prop_on_with_bright, value=value,
                 update_value=False, write_ha_state=False)
-            used_on_with_bright = True
+            used_brightness_on = True
             if self._prop_on:
                 # Dirty logic for lumi.gateway.mgl03 indicator light
                 value_on = True if self._prop_on.format_ == bool else 1
@@ -290,6 +292,25 @@ class Light(MIoTServiceEntity, LightEntity):
             if self._prop_brightness:
                 self.set_prop_value(
                     prop=self._prop_brightness, value=value)
+        elif (
+            light_turns_on_by_brightness(spec_name)
+            and self._prop_brightness
+        ):
+            # lamp39 fill light: writing `on` after idle fails with -9999 and
+            # the firmware turns on the main lamp instead.
+            value_range = self._prop_brightness.value_range
+            value = brightness_for_turn_on(
+                requested=brightness,
+                current=self.get_prop_value(prop=self._prop_brightness),
+                min_value=value_range.min_ if value_range else None,
+                max_value=value_range.max_ if value_range else None)
+            await self.set_property_async(
+                prop=self._prop_brightness, value=value,
+                write_ha_state=False)
+            used_brightness_on = True
+            if self._prop_on:
+                value_on = True if self._prop_on.format_ == bool else 1
+                self.set_prop_value(prop=self._prop_on, value=value_on)
         elif self._prop_on:
             # Dirty logic for lumi.gateway.mgl03 indicator light
             value_on = True if self._prop_on.format_ == bool else 1
@@ -298,7 +319,7 @@ class Light(MIoTServiceEntity, LightEntity):
         # brightness
         if (
             ATTR_BRIGHTNESS in kwargs
-            and not used_on_with_bright
+            and not used_brightness_on
             and self._prop_brightness
         ):
             await self.set_property_async(

@@ -45,6 +45,13 @@ def _lamp39_spec() -> dict:
     on_with_bright['value_range'] = {'min': 1, 'max': 100, 'step': 1}
     ambient_on = _base_spec(
         1, 'urn:miot-spec-v2:property:on:00000006:yeelink-lamp39:1', 'on')
+    ambient_brightness = _base_spec(
+        3,
+        'urn:miot-spec-v2:property:brightness:0000000D:yeelink-lamp39:1',
+        'brightness')
+    ambient_brightness['format'] = 'int'
+    ambient_brightness['unit'] = 'percentage'
+    ambient_brightness['value_range'] = {'min': 1, 'max': 100, 'step': 1}
     return {
         'urn': 'urn:miot-spec-v2:device:light:0000A001:yeelink-lamp39:1',
         'name': 'light',
@@ -75,7 +82,7 @@ def _lamp39_spec() -> dict:
                 'description_trans': 'Ambient Light',
                 'proprietary': False,
                 'need_filter': False,
-                'properties': [ambient_on],
+                'properties': [ambient_on, ambient_brightness],
                 'events': [],
                 'actions': []
             },
@@ -104,15 +111,25 @@ class _Entity:
 
 
 @pytest.mark.github
-def test_brightness_for_on_with_bright():
-    from miot.common import brightness_for_on_with_bright
+def test_brightness_for_turn_on():
+    from miot.common import brightness_for_turn_on
 
-    assert brightness_for_on_with_bright(40, 10, 1, 100) == 40
-    assert brightness_for_on_with_bright(None, 55, 1, 100) == 55
-    assert brightness_for_on_with_bright(None, None, 1, 100) == 1
-    assert brightness_for_on_with_bright(None, None, None, None) == 1
-    assert brightness_for_on_with_bright(0, 80, 1, 100) == 1
-    assert brightness_for_on_with_bright(200, None, 1, 100) == 100
+    assert brightness_for_turn_on(40, 10, 1, 100) == 40
+    assert brightness_for_turn_on(None, 55, 1, 100) == 55
+    assert brightness_for_turn_on(None, None, 1, 100) == 1
+    assert brightness_for_turn_on(None, None, None, None) == 1
+    assert brightness_for_turn_on(0, 80, 1, 100) == 1
+    assert brightness_for_turn_on(200, None, 1, 100) == 100
+
+
+@pytest.mark.github
+def test_light_turns_on_by_brightness():
+    from miot.common import light_turns_on_by_brightness
+
+    assert light_turns_on_by_brightness('ambient-light') is True
+    assert light_turns_on_by_brightness('night-light') is True
+    assert light_turns_on_by_brightness('light') is False
+    assert light_turns_on_by_brightness(None) is False
 
 
 @pytest.mark.github

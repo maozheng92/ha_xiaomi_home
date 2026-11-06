@@ -103,7 +103,7 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
-def brightness_for_on_with_bright(
+def brightness_for_turn_on(
     requested: Optional[int],
     current: Optional[int],
     min_value: Optional[int] = None,
@@ -111,9 +111,9 @@ def brightness_for_on_with_bright(
 ) -> int:
     """Pick a brightness that can turn a sleeping Yeelight on.
 
-    yeelink.light.lamp39 and similar lamps reject writing `on` after they have
-    been off long enough. Their vendor `on-with-bright` property turns the lamp
-    on at a brightness in range, so 0 or a missing value must be clamped.
+    yeelink.light.lamp39 rejects writing `on` after it has been off long
+    enough. The main lamp uses vendor `on-with-bright`; the ambient lamp must
+    write its own brightness instead. 0 or a missing value is clamped to range.
     """
     if requested is not None:
         value = requested
@@ -128,6 +128,16 @@ def brightness_for_on_with_bright(
     if max_value is not None and value > max_value:
         value = max_value
     return int(value)
+
+
+def light_turns_on_by_brightness(service_name: Optional[str]) -> bool:
+    """Return True if writing `on` can wake the wrong lamp after idle.
+
+    lamp39 ambient-light `on` returns -9999 after the fill light has been off,
+    and the firmware turns on the main lamp instead. Brightness on that
+    service is the command that actually opens the fill light.
+    """
+    return service_name in ('ambient-light', 'night-light')
 
 
 def find_on_with_bright_prop(spec_instance: Any) -> Any:
