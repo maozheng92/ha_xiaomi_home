@@ -112,8 +112,9 @@ def brightness_for_turn_on(
     """Pick a brightness that can turn a sleeping Yeelight on.
 
     yeelink.light.lamp39 rejects writing `on` after it has been off long
-    enough. The main lamp uses vendor `on-with-bright`; the ambient lamp must
-    write its own brightness instead. 0 or a missing value is clamped to range.
+    enough. The main lamp uses vendor `on-with-bright`. The fill lamp still
+    uses `on` when it is merely off; brightness is only the idle fallback.
+    0 or a missing value is clamped to range.
     """
     if requested is not None:
         value = requested
@@ -130,14 +131,18 @@ def brightness_for_turn_on(
     return int(value)
 
 
-def light_turns_on_by_brightness(service_name: Optional[str]) -> bool:
-    """Return True if writing `on` can wake the wrong lamp after idle.
+def fill_light_falls_back_to_brightness(
+    service_name: Optional[str], has_on_with_bright: bool = False
+) -> bool:
+    """Return True if a failed fill-light `on` may retry via brightness.
 
-    lamp39 ambient-light `on` returns -9999 after the fill light has been off,
-    and the firmware turns on the main lamp instead. Brightness on that
-    service is the command that actually opens the fill light.
+    lamp39 fill-light `on` can return -9999 after a long idle. Writing
+    brightness instead of `on` does not turn the lamp on when it is simply
+    off, so `on` stays the primary command.
     """
-    return service_name in ('ambient-light', 'night-light')
+    return bool(
+        has_on_with_bright
+        and service_name in ('ambient-light', 'night-light'))
 
 
 def find_on_with_bright_prop(spec_instance: Any) -> Any:

@@ -67,8 +67,8 @@ from homeassistant.util.color import (
 )
 
 from .miot.common import (
-    brightness_for_turn_on, find_on_with_bright_prop,
-    light_turns_on_by_brightness)
+    brightness_for_turn_on, fill_light_falls_back_to_brightness,
+    find_on_with_bright_prop)
 from .miot.miot_spec import MIoTSpecProperty, MIoTSpecService
 from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
@@ -108,6 +108,7 @@ class Light(MIoTServiceEntity, LightEntity):
 
     _brightness_scale: Optional[tuple[int, int]]
     _mode_map: Optional[dict[Any, Any]]
+    _fill_light_on_fallback: bool
 
     def __init__(
         self, miot_device: MIoTDevice,  entity_data: MIoTEntityData
@@ -128,6 +129,7 @@ class Light(MIoTServiceEntity, LightEntity):
         self._prop_mode = None
         self._brightness_scale = None
         self._mode_map = None
+        self._fill_light_on_fallback = False
 
         # properties
         for prop in entity_data.props:
@@ -204,16 +206,20 @@ class Light(MIoTServiceEntity, LightEntity):
                     _LOGGER.info('invalid mode format, %s', self.entity_id)
                     continue
 
+        on_with_bright = self._prop_on_with_bright or find_on_with_bright_prop(
+            miot_device.spec_instance)
         if (
             self._prop_on_with_bright is None
+            and on_with_bright
             and isinstance(entity_data.spec, MIoTSpecService)
             and entity_data.spec.name == 'light'
         ):
-            on_with_bright = find_on_with_bright_prop(
-                miot_device.spec_instance)
-            if on_with_bright:
-                self._prop_on_with_bright = on_with_bright
-                entity_data.props.add(on_with_bright)
+            self._prop_on_with_bright = on_with_bright
+            entity_data.props.add(on_with_bright)
+
+        spec_name = getattr(entity_data.spec, 'name', None)
+        self._fill_light_on_fallback = fill_light_falls_back_to_brightness(
+            spec_name, on_with_bright is not None)
 
         if not self._attr_supported_color_modes:
             if self._prop_brightness:
@@ -272,7 +278,6 @@ class Light(MIoTServiceEntity, LightEntity):
         if ATTR_BRIGHTNESS in kwargs and self._prop_brightness:
             brightness = brightness_to_value(
                 self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
-        spec_name = getattr(self.entity_data.spec, 'name', None)
         used_brightness_on = False
         if self._prop_on_with_bright:
             value_range = self._prop_on_with_bright.value_range
@@ -292,30 +297,34 @@ class Light(MIoTServiceEntity, LightEntity):
             if self._prop_brightness:
                 self.set_prop_value(
                     prop=self._prop_brightness, value=value)
-        elif (
-            light_turns_on_by_brightness(spec_name)
-            and self._prop_brightness
-        ):
-            # lamp39 fill light: writing `on` after idle fails with -9999 and
-            # the firmware turns on the main lamp instead.
-            value_range = self._prop_brightness.value_range
-            value = brightness_for_turn_on(
-                requested=brightness,
-                current=self.get_prop_value(prop=self._prop_brightness),
-                min_value=value_range.min_ if value_range else None,
-                max_value=value_range.max_ if value_range else None)
-            await self.set_property_async(
-                prop=self._prop_brightness, value=value,
-                write_ha_state=False)
-            used_brightness_on = True
-            if self._prop_on:
-                value_on = True if self._prop_on.format_ == bool else 1
-                self.set_prop_value(prop=self._prop_on, value=value_on)
         elif self._prop_on:
             # Dirty logic for lumi.gateway.mgl03 indicator light
             value_on = True if self._prop_on.format_ == bool else 1
-            await self.set_property_async(
-                prop=self._prop_on, value=value_on, write_ha_state=False)
+            try:
+                await self.set_property_async(
+                    prop=self._prop_on, value=value_on, write_ha_state=False)
+            except RuntimeError as err:
+                if not (
+                    self._fill_light_on_fallback
+                    and self._prop_brightness
+                ):
+                    raise
+                # lamp39 fill light: `on` can time out after a long idle.
+                # Brightness is only a fallback; it does not replace `on`.
+                _LOGGER.debug(
+                    'fill light on failed, try brightness, %s, %s',
+                    self.entity_id, err)
+                value_range = self._prop_brightness.value_range
+                value = brightness_for_turn_on(
+                    requested=brightness,
+                    current=self.get_prop_value(prop=self._prop_brightness),
+                    min_value=value_range.min_ if value_range else None,
+                    max_value=value_range.max_ if value_range else None)
+                await self.set_property_async(
+                    prop=self._prop_brightness, value=value,
+                    write_ha_state=False)
+                used_brightness_on = True
+                self.set_prop_value(prop=self._prop_on, value=value_on)
         # brightness
         if (
             ATTR_BRIGHTNESS in kwargs

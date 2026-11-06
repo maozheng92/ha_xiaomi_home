@@ -123,13 +123,17 @@ def test_brightness_for_turn_on():
 
 
 @pytest.mark.github
-def test_light_turns_on_by_brightness():
-    from miot.common import light_turns_on_by_brightness
+def test_fill_light_falls_back_to_brightness():
+    from miot.common import fill_light_falls_back_to_brightness
 
-    assert light_turns_on_by_brightness('ambient-light') is True
-    assert light_turns_on_by_brightness('night-light') is True
-    assert light_turns_on_by_brightness('light') is False
-    assert light_turns_on_by_brightness(None) is False
+    assert fill_light_falls_back_to_brightness(
+        'ambient-light', True) is True
+    assert fill_light_falls_back_to_brightness(
+        'night-light', True) is True
+    assert fill_light_falls_back_to_brightness(
+        'ambient-light', False) is False
+    assert fill_light_falls_back_to_brightness('light', True) is False
+    assert fill_light_falls_back_to_brightness(None, True) is False
 
 
 @pytest.mark.github
