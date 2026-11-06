@@ -147,6 +147,8 @@ def test_attach_on_with_bright_to_main_light_only():
     assert prop is not None
     assert prop.name == 'on-with-bright'
     assert prop.writable
+    assert not prop.readable
+    assert not prop.notifiable
     assert prop.iid == 1
     assert prop.service.iid == 5
 
@@ -164,3 +166,7 @@ def test_attach_on_with_bright_to_main_light_only():
     assert prop in main_light.props
     assert prop not in ambient.props
     assert find_on_with_bright_prop(spec) is prop
+    main_on = next(p for p in main_light.props if p.name == 'on')
+    assert main_on.readable
+    assert main_on.writable
+    assert main_on.notifiable

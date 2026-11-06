@@ -109,12 +109,12 @@ def brightness_for_turn_on(
     min_value: Optional[int] = None,
     max_value: Optional[int] = None
 ) -> int:
-    """Pick a brightness that can turn a sleeping Yeelight on.
+    """Pick a brightness for vendor wake / fill-light idle fallback.
 
-    yeelink.light.lamp39 rejects writing `on` after it has been off long
-    enough. The main lamp uses vendor `on-with-bright`. The fill lamp still
-    uses `on` when it is merely off; brightness is only the idle fallback.
-    0 or a missing value is clamped to range.
+    yeelink.light.lamp39 rejects writing `on` after a long idle. The main
+    lamp wakes with `on-with-bright`, then must still write spec `on` so
+    Home Assistant and Mi Home share the same switch flag. 0 or a missing
+    value is clamped to range.
     """
     if requested is not None:
         value = requested

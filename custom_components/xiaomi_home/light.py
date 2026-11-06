@@ -278,7 +278,9 @@ class Light(MIoTServiceEntity, LightEntity):
         if ATTR_BRIGHTNESS in kwargs and self._prop_brightness:
             brightness = brightness_to_value(
                 self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
-        used_brightness_on = False
+        wrote_spec_brightness = False
+        # Wake a sleeping Yeelight, then write spec `on` so HA and Mi Home
+        # share the same switch flag. Do not fake `on` locally.
         if self._prop_on_with_bright:
             value_range = self._prop_on_with_bright.value_range
             value = brightness_for_turn_on(
@@ -289,15 +291,7 @@ class Light(MIoTServiceEntity, LightEntity):
             await self.set_property_async(
                 prop=self._prop_on_with_bright, value=value,
                 update_value=False, write_ha_state=False)
-            used_brightness_on = True
-            if self._prop_on:
-                # Dirty logic for lumi.gateway.mgl03 indicator light
-                value_on = True if self._prop_on.format_ == bool else 1
-                self.set_prop_value(prop=self._prop_on, value=value_on)
-            if self._prop_brightness:
-                self.set_prop_value(
-                    prop=self._prop_brightness, value=value)
-        elif self._prop_on:
+        if self._prop_on:
             # Dirty logic for lumi.gateway.mgl03 indicator light
             value_on = True if self._prop_on.format_ == bool else 1
             try:
@@ -310,7 +304,6 @@ class Light(MIoTServiceEntity, LightEntity):
                 ):
                     raise
                 # lamp39 fill light: `on` can time out after a long idle.
-                # Brightness is only a fallback; it does not replace `on`.
                 _LOGGER.debug(
                     'fill light on failed, try brightness, %s, %s',
                     self.entity_id, err)
@@ -323,12 +316,13 @@ class Light(MIoTServiceEntity, LightEntity):
                 await self.set_property_async(
                     prop=self._prop_brightness, value=value,
                     write_ha_state=False)
-                used_brightness_on = True
-                self.set_prop_value(prop=self._prop_on, value=value_on)
+                wrote_spec_brightness = True
+                await self.set_property_async(
+                    prop=self._prop_on, value=value_on, write_ha_state=False)
         # brightness
         if (
             ATTR_BRIGHTNESS in kwargs
-            and not used_brightness_on
+            and not wrote_spec_brightness
             and self._prop_brightness
         ):
             await self.set_property_async(
