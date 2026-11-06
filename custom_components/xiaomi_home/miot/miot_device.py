@@ -89,7 +89,8 @@ from .specs.specv2entity import (
     UNIT_PPM,
     UNIT_UG_M3,
 )
-from .common import slugify_name, slugify_did
+from .common import (
+    attach_on_with_bright_to_lights, slugify_name, slugify_did)
 from .const import DOMAIN
 from .miot_client import MIoTClient
 from .miot_error import MIoTClientError, MIoTDeviceError
@@ -675,6 +676,11 @@ class MIoTDevice:
                 miot_service=service)
             if service_entity:
                 self.append_entity(entity_data=service_entity)
+        # Yeelight on-with-bright belongs with the main light, not a number.
+        attach_on_with_bright_to_lights(
+            self.spec_instance, self._entity_list)
+        # STEP 3: property, event and action conversion
+        for service in self.spec_instance.services:
             # STEP 3.1: property conversion
             for prop in service.properties:
                 if prop.platform or not prop.access:

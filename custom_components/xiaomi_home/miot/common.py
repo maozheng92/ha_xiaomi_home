@@ -103,6 +103,61 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
+def brightness_for_on_with_bright(
+    requested: Optional[int],
+    current: Optional[int],
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None
+) -> int:
+    """Pick a brightness that can turn a sleeping Yeelight on.
+
+    yeelink.light.lamp39 and similar lamps reject writing `on` after they have
+    been off long enough. Their vendor `on-with-bright` property turns the lamp
+    on at a brightness in range, so 0 or a missing value must be clamped.
+    """
+    if requested is not None:
+        value = requested
+    elif current is not None:
+        value = current
+    elif min_value is not None:
+        value = min_value
+    else:
+        value = 1
+    if min_value is not None and value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return int(value)
+
+
+def find_on_with_bright_prop(spec_instance: Any) -> Any:
+    """Return the writable vendor on-with-bright property, if any."""
+    for service in getattr(spec_instance, 'services', []) or []:
+        for prop in getattr(service, 'properties', []) or []:
+            if (
+                getattr(prop, 'name', None) == 'on-with-bright'
+                and getattr(prop, 'writable', False)
+            ):
+                return prop
+    return None
+
+
+def attach_on_with_bright_to_lights(
+    spec_instance: Any, entity_list: dict
+) -> None:
+    """Bind on-with-bright to the main light entity instead of a number."""
+    prop = find_on_with_bright_prop(spec_instance)
+    if not prop:
+        return
+    for entity in entity_list.get('light', []):
+        spec = getattr(entity, 'spec', None)
+        if getattr(spec, 'name', None) != 'light':
+            continue
+        prop.platform = 'light'
+        entity.props.add(prop)
+        return
+
+
 class MIoTMatcher(MQTTMatcher):
     """MIoT Pub/Sub topic matcher."""
 

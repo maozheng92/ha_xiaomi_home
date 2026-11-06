@@ -66,7 +66,9 @@ from homeassistant.util.color import (
     brightness_to_value
 )
 
-from .miot.miot_spec import MIoTSpecProperty
+from .miot.common import (
+    brightness_for_on_with_bright, find_on_with_bright_prop)
+from .miot.miot_spec import MIoTSpecProperty, MIoTSpecService
 from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
 
@@ -97,6 +99,7 @@ class Light(MIoTServiceEntity, LightEntity):
     # pylint: disable=unused-argument
     _VALUE_RANGE_MODE_COUNT_MAX = 30
     _prop_on: Optional[MIoTSpecProperty]
+    _prop_on_with_bright: Optional[MIoTSpecProperty]
     _prop_brightness: Optional[MIoTSpecProperty]
     _prop_color_temp: Optional[MIoTSpecProperty]
     _prop_color: Optional[MIoTSpecProperty]
@@ -117,6 +120,7 @@ class Light(MIoTServiceEntity, LightEntity):
             self._attr_icon = 'mdi:lightbulb-group'
 
         self._prop_on = None
+        self._prop_on_with_bright = None
         self._prop_brightness = None
         self._prop_color_temp = None
         self._prop_color = None
@@ -129,6 +133,8 @@ class Light(MIoTServiceEntity, LightEntity):
             # on
             if prop.name == 'on':
                 self._prop_on = prop
+            if prop.name == 'on-with-bright':
+                self._prop_on_with_bright = prop
             # brightness
             if prop.name == 'brightness':
                 if prop.value_range:
@@ -197,6 +203,17 @@ class Light(MIoTServiceEntity, LightEntity):
                     _LOGGER.info('invalid mode format, %s', self.entity_id)
                     continue
 
+        if (
+            self._prop_on_with_bright is None
+            and isinstance(entity_data.spec, MIoTSpecService)
+            and entity_data.spec.name == 'light'
+        ):
+            on_with_bright = find_on_with_bright_prop(
+                miot_device.spec_instance)
+            if on_with_bright:
+                self._prop_on_with_bright = on_with_bright
+                entity_data.props.add(on_with_bright)
+
         if not self._attr_supported_color_modes:
             if self._prop_brightness:
                 self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
@@ -250,16 +267,40 @@ class Light(MIoTServiceEntity, LightEntity):
 
         Shall set attributes in kwargs if applicable.
         """
-        # on
-        # Dirty logic for lumi.gateway.mgl03 indicator light
-        if self._prop_on:
-            value_on = True if self._prop_on.format_ == bool else 1
-            await self.set_property_async(
-                prop=self._prop_on, value=value_on)
-        # brightness
-        if ATTR_BRIGHTNESS in kwargs:
+        brightness = None
+        if ATTR_BRIGHTNESS in kwargs and self._prop_brightness:
             brightness = brightness_to_value(
                 self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
+        used_on_with_bright = False
+        if self._prop_on_with_bright:
+            value_range = self._prop_on_with_bright.value_range
+            value = brightness_for_on_with_bright(
+                requested=brightness,
+                current=self.get_prop_value(prop=self._prop_brightness),
+                min_value=value_range.min_ if value_range else None,
+                max_value=value_range.max_ if value_range else None)
+            await self.set_property_async(
+                prop=self._prop_on_with_bright, value=value,
+                update_value=False, write_ha_state=False)
+            used_on_with_bright = True
+            if self._prop_on:
+                # Dirty logic for lumi.gateway.mgl03 indicator light
+                value_on = True if self._prop_on.format_ == bool else 1
+                self.set_prop_value(prop=self._prop_on, value=value_on)
+            if self._prop_brightness:
+                self.set_prop_value(
+                    prop=self._prop_brightness, value=value)
+        elif self._prop_on:
+            # Dirty logic for lumi.gateway.mgl03 indicator light
+            value_on = True if self._prop_on.format_ == bool else 1
+            await self.set_property_async(
+                prop=self._prop_on, value=value_on, write_ha_state=False)
+        # brightness
+        if (
+            ATTR_BRIGHTNESS in kwargs
+            and not used_on_with_bright
+            and self._prop_brightness
+        ):
             await self.set_property_async(
                 prop=self._prop_brightness, value=brightness,
                 write_ha_state=False)
