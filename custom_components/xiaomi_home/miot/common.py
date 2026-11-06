@@ -103,6 +103,32 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
+def cover_position_reached(
+    current: Optional[int], target: int, dead_zone: int = 0
+) -> bool:
+    """Return True if the cover is already at the requested position."""
+    if current is None:
+        return False
+    return abs(current - target) <= dead_zone
+
+
+def should_refresh_cover_prop(
+    prop_name: str, readable_names: set
+) -> bool:
+    """Return False for cover properties that must not be pulled.
+
+    dooya.curtain.dt98 and similar motors treat a get of target-position as
+    a go-to command. After Home Assistant restarts, that makes a closed
+    curtain open briefly and then close. Pull current-position instead.
+    """
+    if (
+        prop_name == 'target-position'
+        and 'current-position' in readable_names
+    ):
+        return False
+    return True
+
+
 class MIoTMatcher(MQTTMatcher):
     """MIoT Pub/Sub topic matcher."""
 

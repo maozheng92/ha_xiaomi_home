@@ -57,6 +57,7 @@ from homeassistant.components.cover import (ATTR_POSITION, CoverEntity,
                                             CoverEntityFeature,
                                             CoverDeviceClass)
 
+from .miot.common import cover_position_reached
 from .miot.miot_spec import MIoTSpecProperty
 from .miot.miot_device import MIoTDevice, MIoTEntityData, MIoTServiceEntity
 from .miot.const import DOMAIN
@@ -219,6 +220,10 @@ class Cover(MIoTServiceEntity, CoverEntity):
 
     async def async_open_cover(self, **kwargs) -> None:
         """Open the cover."""
+        if cover_position_reached(
+                self.current_cover_position, 100,
+                self._cover_dead_zone_width):
+            return
         current = None if (self._prop_current_position
                            is None) else self.get_prop_value(
                                prop=self._prop_current_position)
@@ -230,6 +235,10 @@ class Cover(MIoTServiceEntity, CoverEntity):
 
     async def async_close_cover(self, **kwargs) -> None:
         """Close the cover."""
+        if cover_position_reached(
+                self.current_cover_position, 0,
+                self._cover_dead_zone_width):
+            return
         current = None if (self._prop_current_position
                            is None) else self.get_prop_value(
                                prop=self._prop_current_position)
@@ -252,6 +261,9 @@ class Cover(MIoTServiceEntity, CoverEntity):
         if pos is None:
             return None
         current = self.current_cover_position
+        if cover_position_reached(
+                current, pos, self._cover_dead_zone_width):
+            return None
         if current is not None:
             self._prop_pos_opening = pos > current
             self._prop_pos_closing = pos < current

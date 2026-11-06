@@ -89,7 +89,8 @@ from .specs.specv2entity import (
     UNIT_PPM,
     UNIT_UG_M3,
 )
-from .common import slugify_name, slugify_did
+from .common import (
+    should_refresh_cover_prop, slugify_name, slugify_did)
 from .const import DOMAIN
 from .miot_client import MIoTClient
 from .miot_error import MIoTClientError, MIoTDeviceError
@@ -1245,8 +1246,12 @@ class MIoTServiceEntity(Entity):
         self.__refresh_props_value()
 
     def __refresh_props_value(self) -> None:
+        readable_names = {
+            prop.name for prop in self.entity_data.props if prop.readable}
         for prop in self.entity_data.props:
             if not prop.readable:
+                continue
+            if not should_refresh_cover_prop(prop.name, readable_names):
                 continue
             self.miot_device.miot_client.request_refresh_prop(
                 did=self.miot_device.did, siid=prop.service.iid, piid=prop.iid)
