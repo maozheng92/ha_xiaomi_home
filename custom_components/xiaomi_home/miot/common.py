@@ -103,6 +103,37 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
+def entity_uses_native_temperature(entity_cls: type) -> bool:
+    """Return whether the entity class reads native temperature members.
+
+    Home Assistant 2026.11 renamed the climate and water heater temperature
+    members. A core that defines ``native_temperature_unit`` reads those
+    names and reports integrations that still provide the previous ones.
+    """
+    return any(
+        'native_temperature_unit' in vars(klass)
+        for klass in entity_cls.__mro__)
+
+
+def lookup_device_entry(
+    registry: Any, identifier: tuple[str, str], config_entry_id: str
+) -> Any:
+    """Look up a device entry owned by one config entry.
+
+    Home Assistant 2026.8 makes device identifiers unique per config entry.
+    ``async_get_device`` is deprecated because that lookup is ambiguous, and
+    it stops working in 2027.8. Use ``async_get_device_by_identifier`` when
+    the registry provides it. Older registries still key devices by identifier
+    alone.
+    """
+    get_by_identifier = getattr(
+        registry, 'async_get_device_by_identifier', None)
+    if get_by_identifier is not None:
+        return get_by_identifier(identifier, config_entry_id)
+    return registry.async_get_device(
+        identifiers={identifier}, connections=None)
+
+
 class MIoTMatcher(MQTTMatcher):
     """MIoT Pub/Sub topic matcher."""
 

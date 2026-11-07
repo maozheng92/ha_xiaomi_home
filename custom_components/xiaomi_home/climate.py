@@ -57,11 +57,17 @@ from homeassistant.components.climate import (
     FAN_ON, FAN_OFF, SWING_OFF, SWING_BOTH, SWING_VERTICAL, SWING_HORIZONTAL,
     ATTR_TEMPERATURE, HVACMode, HVACAction, ClimateEntity, ClimateEntityFeature)
 
+from .miot.common import entity_uses_native_temperature
 from .miot.const import DOMAIN
 from .miot.miot_device import MIoTDevice, MIoTServiceEntity, MIoTEntityData
 from .miot.miot_spec import MIoTSpecProperty
 
 _LOGGER = logging.getLogger(__name__)
+
+# Home Assistant 2026.11 reads native_* temperature members. Defining the
+# previous names on that release logs a deprecation warning, and those names
+# are removed in 2027.11. Older cores only read the previous names.
+_USE_NATIVE_TEMPERATURE = entity_uses_native_temperature(ClimateEntity)
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry,
@@ -133,10 +139,10 @@ class FeatureTargetTemperature(MIoTServiceEntity, ClimateEntity):
                  entity_data: MIoTEntityData) -> None:
         """Initialize the feature class."""
         self._prop_target_temp = None
-        self._attr_temperature_unit = None
 
         super().__init__(miot_device=miot_device, entity_data=entity_data)
         # properties
+        temperature_unit = None
         for prop in entity_data.props:
             if prop.name == 'target-temperature':
                 if not prop.value_range:
@@ -147,14 +153,18 @@ class FeatureTargetTemperature(MIoTServiceEntity, ClimateEntity):
                 self._attr_min_temp = prop.value_range.min_
                 self._attr_max_temp = prop.value_range.max_
                 self._attr_target_temperature_step = prop.value_range.step
-                self._attr_temperature_unit = prop.external_unit
+                temperature_unit = prop.external_unit
                 self._attr_supported_features |= (
                     ClimateEntityFeature.TARGET_TEMPERATURE)
                 self._prop_target_temp = prop
                 break
-        # temperature_unit is required by the climate entity
-        if not self._attr_temperature_unit:
-            self._attr_temperature_unit = UnitOfTemperature.CELSIUS
+        # The climate entity requires a temperature unit.
+        if not temperature_unit:
+            temperature_unit = UnitOfTemperature.CELSIUS
+        if _USE_NATIVE_TEMPERATURE:
+            self._attr_native_temperature_unit = temperature_unit
+        else:
+            self._attr_temperature_unit = temperature_unit
 
     async def async_set_temperature(self, **kwargs):
         """Set the target temperature."""
@@ -168,11 +178,25 @@ class FeatureTargetTemperature(MIoTServiceEntity, ClimateEntity):
             await self.set_property_async(prop=self._prop_target_temp,
                                           value=temp)
 
-    @property
-    def target_temperature(self) -> Optional[float]:
-        """The current target temperature."""
-        return (self.get_prop_value(
-            prop=self._prop_target_temp) if self._prop_target_temp else None)
+    def _target_temperature(self) -> Optional[float]:
+        """Return the target temperature in the device unit."""
+        if self._prop_target_temp is None:
+            return None
+        return self.get_prop_value(prop=self._prop_target_temp)
+
+    if _USE_NATIVE_TEMPERATURE:
+
+        @property
+        def native_target_temperature(self) -> Optional[float]:
+            """Return the target temperature in the device unit."""
+            return self._target_temperature()
+
+    else:
+
+        @property
+        def target_temperature(self) -> Optional[float]:
+            """Return the target temperature in the device unit."""
+            return self._target_temperature()
 
 
 class FeaturePresetMode(MIoTServiceEntity, ClimateEntity):
@@ -379,11 +403,25 @@ class FeatureTemperature(MIoTServiceEntity, ClimateEntity):
                 self._prop_env_temperature = prop
                 break
 
-    @property
-    def current_temperature(self) -> Optional[float]:
-        """The current environment temperature."""
-        return (self.get_prop_value(prop=self._prop_env_temperature)
-                if self._prop_env_temperature else None)
+    def _current_temperature(self) -> Optional[float]:
+        """Return the measured temperature in the device unit."""
+        if self._prop_env_temperature is None:
+            return None
+        return self.get_prop_value(prop=self._prop_env_temperature)
+
+    if _USE_NATIVE_TEMPERATURE:
+
+        @property
+        def native_current_temperature(self) -> Optional[float]:
+            """Return the measured temperature in the device unit."""
+            return self._current_temperature()
+
+    else:
+
+        @property
+        def current_temperature(self) -> Optional[float]:
+            """Return the measured temperature in the device unit."""
+            return self._current_temperature()
 
 
 class FeatureHumidity(MIoTServiceEntity, ClimateEntity):
