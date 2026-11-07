@@ -11,6 +11,7 @@ def test_local_write_needs_cloud():
 
     assert local_write_needs_cloud(-9999) is True
     assert local_write_needs_cloud(-10006) is True
+    assert local_write_needs_cloud(-4002) is True
     assert local_write_needs_cloud(0) is False
     assert local_write_needs_cloud(1) is False
     assert local_write_needs_cloud(-704042011) is False
@@ -26,6 +27,7 @@ def test_should_start_cloud_write():
     assert should_start_cloud_write(True, None) is True
     assert should_start_cloud_write(True, -9999) is True
     assert should_start_cloud_write(True, -10006) is True
+    assert should_start_cloud_write(True, -4002) is True
     assert should_start_cloud_write(True, 0) is False
     assert should_start_cloud_write(True, 1) is False
     assert should_start_cloud_write(True, -704042011) is False

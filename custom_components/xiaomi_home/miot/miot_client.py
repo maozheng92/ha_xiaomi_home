@@ -689,6 +689,37 @@ class MIoTClient:
             else:
                 task.add_done_callback(cls._consume_prop_task)
 
+    def _prop_write_tails(self) -> dict:
+        tails = getattr(self, '_prop_write_tail_map', None)
+        if tails is None:
+            tails = {}
+            self._prop_write_tail_map = tails
+        return tails
+
+    async def _wait_prop_write_tail(self, did: str) -> None:
+        """Wait until the previous write to this device has finished.
+
+        turn_on writes ``on`` and then brightness. Returning when the
+        faster path succeeds leaves the other path running; the next
+        write then overlaps it and hotata.airer.d10zm answers -4002.
+        """
+        pending = {
+            task for task in self._prop_write_tails().get(did, ())
+            if not task.done()
+        }
+        if not pending:
+            self._prop_write_tails().pop(did, None)
+            return
+        await asyncio.wait(pending)
+        self._prop_write_tails().pop(did, None)
+
+    def _keep_prop_write_tail(self, did: str, tasks: set) -> None:
+        running = {task for task in tasks if not task.done()}
+        if running:
+            self._prop_write_tails()[did] = running
+        else:
+            self._prop_write_tails().pop(did, None)
+
     def _raise_no_link(self) -> None:
         raise MIoTClientError(
             f'{self._i18n.translate("miot.client.device_exec_error")}, '
@@ -730,11 +761,11 @@ class MIoTClient:
 
     async def _set_prop_cloud_async(
         self, did: str, siid: int, piid: int, value: Any
-    ) -> bool:
-        """Write one property through Xiaomi cloud."""
+    ) -> Optional[int]:
+        """Write one property through Xiaomi cloud and return its code."""
         device_cloud = self._device_list_cloud.get(did, None)
         if not device_cloud or not device_cloud.get('online', False):
-            return False
+            return None
         result = await self._http.set_prop_async(
             params=[{
                 'did': did, 'siid': siid, 'piid': piid, 'value': value
@@ -743,27 +774,34 @@ class MIoTClient:
             'cloud set prop, %s.%d.%d, %s -> %s',
             did, siid, piid, value, result)
         if not result or len(result) != 1:
-            return False
+            return None
         rc = result[0].get(
             'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-        if rc in (0, 1):
-            return True
         if rc in (-704010000, -704042011):
             # Device remove or offline
             _LOGGER.error('device may be removed or offline, %s', did)
             self._main_loop.create_task(
                 await self.__refresh_cloud_device_with_dids_async(
                     dids=[did]))
-        raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
+        return rc
+
+    def _finish_prop_write(
+        self, did: str, pending: set, ok: bool
+    ) -> bool:
+        self._keep_prop_write_tail(did, pending)
+        self._detach_prop_tasks(pending)
+        return ok
 
     async def _await_prop_writes(
-        self, local_task: asyncio.Task, cloud_task: asyncio.Task,
+        self, did: str, siid: int, piid: int, value: Any,
+        local_task: asyncio.Task, cloud_task: asyncio.Task,
         local_rc: Optional[int]
     ) -> bool:
         """Return when local or cloud accepts the same write."""
         pending = {cloud_task}
         if not local_task.done():
             pending.add(local_task)
+        cloud_rc: Optional[int] = None
         cloud_error: Optional[BaseException] = None
         while pending:
             done, pending = await asyncio.wait(
@@ -779,26 +817,33 @@ class MIoTClient:
                 if task is local_task:
                     local_rc = outcome
                     if local_rc in (0, 1):
-                        self._detach_prop_tasks(pending)
-                        return True
+                        return self._finish_prop_write(did, pending, True)
                     if (
                         local_rc is not None
                         and not local_write_needs_cloud(local_rc)
                     ):
-                        self._detach_prop_tasks(pending)
+                        self._finish_prop_write(did, pending, False)
                         raise MIoTClientError(
                             self.__get_exec_error_with_rc(rc=local_rc))
                     continue
-                if outcome is True:
-                    self._detach_prop_tasks(pending)
-                    return True
-        if isinstance(cloud_error, MIoTClientError):
+                cloud_rc = outcome
+                if cloud_rc in (0, 1):
+                    return self._finish_prop_write(did, pending, True)
+        # Both paths rejected the write. A parallel pair often makes
+        # hotata.airer.d10zm answer -4002 on each. Retry cloud alone.
+        if local_rc == -4002 and cloud_rc == -4002:
+            _LOGGER.info(
+                'prop set overlapped, retry cloud, %s.%d.%d',
+                did, siid, piid)
+            cloud_rc = await self._set_prop_cloud_async(
+                did, siid, piid, value)
+            if cloud_rc in (0, 1):
+                return True
+        if cloud_error and cloud_rc is None:
             raise cloud_error
-        if local_rc is not None and local_write_needs_cloud(local_rc):
-            raise MIoTClientError(
-                self.__get_exec_error_with_rc(rc=local_rc))
-        if cloud_error:
-            raise cloud_error
+        rc = cloud_rc if cloud_rc is not None else local_rc
+        if rc is not None:
+            raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
         self._raise_no_link()
         return False
 
@@ -807,6 +852,7 @@ class MIoTClient:
     ) -> bool:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
+        await self._wait_prop_write_tail(did)
         # Local stays preferred when it answers quickly. An idle Yeelight
         # does not, so cloud starts before the gateway ack timeout ends.
         local_task = self._main_loop.create_task(
@@ -838,7 +884,7 @@ class MIoTClient:
         cloud_task = self._main_loop.create_task(
             self._set_prop_cloud_async(did, siid, piid, value))
         return await self._await_prop_writes(
-            local_task, cloud_task, local_rc)
+            did, siid, piid, value, local_task, cloud_task, local_rc)
 
     def request_refresh_prop(
         self, did: str, siid: int, piid: int

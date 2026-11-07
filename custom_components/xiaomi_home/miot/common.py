@@ -112,11 +112,13 @@ def local_write_needs_cloud(rc: Optional[int]) -> bool:
     """Return True when a local write should be retried in the cloud.
 
     -9999 is the device reply "user ack timeout". yeelink.light.lamp39
-    returns it through the central gateway after the lamp has been idle,
-    so writing ``on`` fails while Mi Home, which uses cloud, still works.
+    returns it through the central gateway after the lamp has been idle.
     -10006 is the gateway request timeout for the same case.
+    -4002 is "property not writable". hotata.airer.d10zm returns it for
+    light brightness when a second local write overlaps the first, and
+    also when the gateway cannot apply a write that cloud still accepts.
     """
-    return rc in (-9999, -10006)
+    return rc in (-9999, -10006, -4002)
 
 
 def local_write_grace_sec() -> float:
