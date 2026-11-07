@@ -67,7 +67,7 @@ from paho.mqtt.client import (
     MQTTMessage)
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher
+from .common import MIoTMatcher, iter_cloud_uplink
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -903,18 +903,16 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'piid' not in msg['params']
-                or 'value' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'piid', 'value'))
+            if not changes:
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on properties_changed, %s', payload)
-                handler(msg['params'], ctx)
+                for params in changes:
+                    handler(params, ctx)
         return self.__reg_broadcast_external(
             topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx)
 
@@ -955,19 +953,18 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'eiid' not in msg['params']
-                or 'arguments' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'eiid', 'arguments'))
+            if not changes:
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on on_event_msg, %s', payload)
-                msg['params']['from'] = 'cloud'
-                handler(msg['params'], ctx)
+                for params in changes:
+                    notified = dict(params)
+                    notified['from'] = 'cloud'
+                    handler(notified, ctx)
         return self.__reg_broadcast_external(
             topic=topic, handler=on_event_msg, handler_ctx=handler_ctx)
 

@@ -49,7 +49,7 @@ import asyncio
 import json
 from os import path
 import random
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import hashlib
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -202,3 +202,112 @@ async def get_system_info_str(hass) -> str:
         f'hass/{version} ({os_name}/{os_version};'
         f' {arch}; {installation_type})'
     )
+
+
+# The device, or the route waiting on it, did not answer in time.
+# Another route can still deliver the same write.
+ROUTE_TIMEOUT_CODES = frozenset({
+    -9999, -10006, -704053036, -704083036,
+})
+# A light that has been off for a long time often wakes on the first
+# packet and misses that acknowledgement. One more try on the same
+# route succeeds; -10006 already waited out the local timer.
+SOFT_DEVICE_TIMEOUT_CODES = frozenset({
+    -9999, -704053036, -704083036,
+})
+ROUTE_OK = 'ok'
+ROUTE_RETRY = 'retry'
+ROUTE_NEXT = 'next'
+ROUTE_FAIL = 'fail'
+
+
+def control_route_plan(rc: int, retried: bool) -> str:
+    """Choose ok, retry, next route, or fail for a control result."""
+    if rc in (0, 1):
+        return ROUTE_OK
+    if not retried and rc in SOFT_DEVICE_TIMEOUT_CODES:
+        return ROUTE_RETRY
+    if rc in ROUTE_TIMEOUT_CODES:
+        return ROUTE_NEXT
+    return ROUTE_FAIL
+
+
+async def run_control_routes(
+    routes: list,
+    retry_delay: float = 1.0,
+    sleep: Optional[Callable] = None,
+    on_plan: Optional[Callable] = None,
+) -> tuple[bool, Optional[int]]:
+    """Try gateway, then LAN, then cloud, until one accepts the command.
+
+    Each route is ``(name, async_call)``. ``async_call`` returns the
+    device code, or None when that route produced no code. Returns
+    ``(True, code)`` on success. Returns ``(False, code)`` when a route
+    failed for a reason other than a timeout, or when every route timed
+    out. ``code`` is None when no route reported one.
+    """
+    pause: Callable = sleep or asyncio.sleep
+    last_rc: Optional[int] = None
+    for name, call in routes:
+        retried = False
+        while True:
+            rc = await call()
+            if not isinstance(rc, int):
+                break
+            plan = control_route_plan(rc, retried)
+            if on_plan and plan != ROUTE_OK:
+                on_plan(name, rc, plan)
+            if plan == ROUTE_OK:
+                return True, rc
+            last_rc = rc
+            if plan == ROUTE_RETRY:
+                retried = True
+                await pause(retry_delay)
+                continue
+            if plan == ROUTE_FAIL:
+                return False, rc
+            break
+    return False, last_rc
+
+
+def did_from_device_topic(topic: str) -> Optional[str]:
+    """Return the did encoded in ``device/{did}/up/...``."""
+    parts = str(topic).split('/')
+    if len(parts) >= 2 and parts[0] == 'device' and parts[1]:
+        return parts[1]
+    return None
+
+
+def with_did(params: dict, did: Optional[str]) -> dict:
+    """Copy a property or event payload and fill a missing did."""
+    if did and isinstance(params, dict) and 'did' not in params:
+        return {**params, 'did': did}
+    return params
+
+
+def iter_cloud_uplink(
+    topic: str, msg: Any, required: tuple
+) -> list[dict]:
+    """Normalize one cloud properties_changed or event_occured message.
+
+    ``params`` is either one object or a list of objects. The did is in
+    the topic when an object does not repeat it. Handlers match
+    subscriptions by did, so a missing did drops the update and the
+    entity keeps a stale state.
+    """
+    if not isinstance(msg, dict):
+        return []
+    raw = msg.get('params', None)
+    if isinstance(raw, dict):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = [item for item in raw if isinstance(item, dict)]
+    else:
+        return []
+    did = did_from_device_topic(topic)
+    changes = []
+    for item in items:
+        if any(key not in item for key in required):
+            continue
+        changes.append(with_did(item, did))
+    return changes
