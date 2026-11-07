@@ -965,6 +965,7 @@ class MIoTServiceEntity(Entity):
 
     _pending_write_ha_state_timer: Optional[asyncio.TimerHandle]
     _resync_timer: Optional[asyncio.TimerHandle]
+    _resync_prop: Optional[MIoTSpecProperty]
 
     def __init__(
         self, miot_device: MIoTDevice, entity_data: MIoTEntityData
@@ -1012,6 +1013,7 @@ class MIoTServiceEntity(Entity):
         self._prop_changed_subs = {}
         self._pending_write_ha_state_timer = None
         self._resync_timer = None
+        self._resync_prop = None
         _LOGGER.info(
             'new miot service entity, %s, %s, %s, %s',
             self.miot_device.name, self._attr_name, self.entity_data.spec.name,
@@ -1156,7 +1158,7 @@ class MIoTServiceEntity(Entity):
                 did=self.miot_device.did, siid=prop.service.iid,
                 piid=prop.iid, value=value)
         except MIoTClientError as e:
-            self.__schedule_failed_write_resync()
+            self.__schedule_failed_write_resync(prop)
             raise RuntimeError(
                 f'{e}, {self.entity_id}, {self.name}, {prop.name}, '
                 f'value={value}') from e
@@ -1271,14 +1273,17 @@ class MIoTServiceEntity(Entity):
         self._pending_write_ha_state_timer = None
         self.async_write_ha_state()
 
-    def __schedule_failed_write_resync(self) -> None:
-        """Re-read properties after a write the device did not ack.
+    def __schedule_failed_write_resync(
+        self, prop: MIoTSpecProperty
+    ) -> None:
+        """Read the bulb after a command it did not accept.
 
-        A sleeping Yeelight can apply ``on=true`` and still return
-        code -9999. The immediate read plus a later one pulls the value
-        Mi Home is showing once the cloud cache catches up.
+        The first attempt after a long off leaves the bulb unchanged.
+        The cloud cache is stale too, so the value has to come from the
+        bulb. A later read catches a command that lands late.
         """
-        self.__refresh_props_safe()
+        self._resync_prop = prop
+        self.__read_device_prop(prop)
         if self._resync_timer:
             self._resync_timer.cancel()
         self._resync_timer = self._main_loop.call_later(
@@ -1286,11 +1291,16 @@ class MIoTServiceEntity(Entity):
 
     def __failed_write_resync(self) -> None:
         self._resync_timer = None
-        self.__refresh_props_safe()
+        prop = getattr(self, '_resync_prop', None)
+        if prop is not None:
+            self.__read_device_prop(prop)
 
-    def __refresh_props_safe(self) -> None:
+    def __read_device_prop(self, prop: MIoTSpecProperty) -> None:
         try:
-            self.__refresh_props_value()
+            self.miot_device.miot_client.request_device_sync(
+                did=self.miot_device.did,
+                siid=prop.service.iid,
+                piid=prop.iid)
         except MIoTClientError as err:
             _LOGGER.debug('resync after failed write, %s', err)
 
@@ -1457,7 +1467,7 @@ class MIoTPropertyEntity(Entity):
         self.async_write_ha_state()
 
     def __schedule_failed_write_resync(self) -> None:
-        self.__request_refresh_safe()
+        self.__read_device_prop()
         if self._resync_timer:
             self._resync_timer.cancel()
         self._resync_timer = self._main_loop.call_later(
@@ -1465,11 +1475,14 @@ class MIoTPropertyEntity(Entity):
 
     def __failed_write_resync(self) -> None:
         self._resync_timer = None
-        self.__request_refresh_safe()
+        self.__read_device_prop()
 
-    def __request_refresh_safe(self) -> None:
+    def __read_device_prop(self) -> None:
         try:
-            self.__request_refresh_prop()
+            self.miot_device.miot_client.request_device_sync(
+                did=self.miot_device.did,
+                siid=self.service.iid,
+                piid=self.spec.iid)
         except MIoTClientError as err:
             _LOGGER.debug('resync after failed write, %s', err)
 

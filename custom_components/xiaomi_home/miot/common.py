@@ -209,9 +209,9 @@ async def get_system_info_str(hass) -> str:
 ROUTE_TIMEOUT_CODES = frozenset({
     -9999, -10006, -704053036, -704083036,
 })
-# A light that has been off for a long time often wakes on the first
-# packet and misses that acknowledgement. One more try on the same
-# route succeeds; -10006 already waited out the local timer.
+# A light that has been off for a long time drops the first command and
+# stays off. The same route accepts the next one. -10006 already waited
+# out the local timer, so that code changes route immediately.
 SOFT_DEVICE_TIMEOUT_CODES = frozenset({
     -9999, -704053036, -704083036,
 })
@@ -237,14 +237,15 @@ async def run_control_routes(
     retry_delay: float = 1.0,
     sleep: Optional[Callable] = None,
     on_plan: Optional[Callable] = None,
-) -> tuple[bool, Optional[int]]:
+) -> tuple[bool, Optional[int], Optional[str]]:
     """Try gateway, then LAN, then cloud, until one accepts the command.
 
     Each route is ``(name, async_call)``. ``async_call`` returns the
     device code, or None when that route produced no code. Returns
-    ``(True, code)`` on success. Returns ``(False, code)`` when a route
-    failed for a reason other than a timeout, or when every route timed
-    out. ``code`` is None when no route reported one.
+    ``(True, code, route)`` on success. Returns ``(False, code, route)``
+    when a route failed for a reason other than a timeout. Returns
+    ``(False, code, None)`` when every route timed out. ``code`` is
+    None when no route reported one.
     """
     pause: Callable = sleep or asyncio.sleep
     last_rc: Optional[int] = None
@@ -258,16 +259,47 @@ async def run_control_routes(
             if on_plan and plan != ROUTE_OK:
                 on_plan(name, rc, plan)
             if plan == ROUTE_OK:
-                return True, rc
+                return True, rc, name
             last_rc = rc
             if plan == ROUTE_RETRY:
                 retried = True
                 await pause(retry_delay)
                 continue
             if plan == ROUTE_FAIL:
-                return False, rc
+                return False, rc, name
             break
-    return False, last_rc
+    return False, last_rc, None
+
+
+def same_prop_value(left: Any, right: Any) -> bool:
+    """Compare property values, treating 0/1 and False/True as the same."""
+    if left == right:
+        return True
+    if isinstance(left, bool) or isinstance(right, bool):
+        if isinstance(left, (bool, int)) and isinstance(right, (bool, int)):
+            if not isinstance(left, bool):
+                left = bool(left)
+            if not isinstance(right, bool):
+                right = bool(right)
+            return left == right
+    return False
+
+
+def should_push_cloud_shadow(
+    live: Any, shadow: Any, fail_at: float, now: float, backoff: float
+) -> bool:
+    """The cloud shadow is what Mi Home shows when the bulb stops reporting.
+
+    Push the live value only when a device read and the cloud cache
+    disagree. A missing cache read is not a disagreement.
+    """
+    if live is None or shadow is None:
+        return False
+    if same_prop_value(live, shadow):
+        return False
+    if fail_at and now - fail_at < backoff:
+        return False
+    return True
 
 
 def did_from_device_topic(topic: str) -> Optional[str]:

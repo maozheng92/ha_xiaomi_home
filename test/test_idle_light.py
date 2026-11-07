@@ -53,9 +53,10 @@ def test_sleeping_gateway_falls_through_to_cloud():
             retry_delay=0,
             sleep=pause)
 
-    ok, rc = asyncio.run(scenario())
+    ok, rc, route = asyncio.run(scenario())
     assert ok is True
     assert rc == 0
+    assert route == 'cloud'
     assert calls == ['gateway', 'gateway', 'cloud']
 
 
@@ -79,9 +80,10 @@ def test_local_timeout_skips_retry_and_uses_cloud():
             retry_delay=0,
             sleep=pause)
 
-    ok, rc = asyncio.run(scenario())
+    ok, rc, route = asyncio.run(scenario())
     assert ok is True
     assert rc == 1
+    assert route == 'cloud'
     assert calls == ['gateway', 'cloud']
 
 
@@ -105,9 +107,10 @@ def test_property_error_does_not_fall_through():
             retry_delay=0,
             sleep=pause)
 
-    ok, rc = asyncio.run(scenario())
+    ok, rc, route = asyncio.run(scenario())
     assert ok is False
     assert rc == -4005
+    assert route == 'gateway'
     assert calls == ['gateway']
 
 
@@ -131,6 +134,22 @@ def test_cloud_uplink_fills_did_from_topic():
         topic, single, ('siid', 'piid', 'value')) == [single['params']]
     assert iter_cloud_uplink(topic, {'params': {}}, ('value',)) == []
     assert with_did({'siid': 4, 'value': True}, 'lamp')['did'] == 'lamp'
+
+
+@pytest.mark.github
+def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
+    """Button and Mi Home changes leave the other side on the old value."""
+    from miot.common import same_prop_value, should_push_cloud_shadow
+
+    assert same_prop_value(True, 1)
+    assert same_prop_value(False, 0)
+    assert not same_prop_value(True, False)
+    assert should_push_cloud_shadow(True, False, 0, 100, 60)
+    assert not should_push_cloud_shadow(True, True, 0, 100, 60)
+    assert not should_push_cloud_shadow(True, 1, 0, 100, 60)
+    assert not should_push_cloud_shadow(True, None, 0, 100, 60)
+    assert not should_push_cloud_shadow(True, False, 80, 100, 60)
+    assert should_push_cloud_shadow(True, False, 30, 100, 60)
 
 
 @pytest.mark.github
