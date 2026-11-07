@@ -60,9 +60,9 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, action_result_ok, direct_write_timeout_ms,
-    get_system_info_str, local_write_grace_sec, local_write_needs_cloud,
-    prefers_cloud_write, prop_codes_win, reject_bool_as_int,
+    MIoTMatcher, action_result_ok, cloud_value_rejected,
+    direct_write_timeout_ms, get_system_info_str, local_write_grace_sec,
+    local_write_needs_cloud, prefers_cloud_write, prop_codes_win,
     should_start_cloud_write, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
@@ -944,6 +944,43 @@ class MIoTClient:
                     dids=[did]))
         return codes
 
+    async def _set_props_gateway_async(
+        self, did: str, props: list[dict]
+    ) -> Optional[list]:
+        """Write through the central gateway.
+
+        Home Assistant often cannot reach the lamp on UDP, and Xiaomi
+        cloud rejects a Yeelight bool. The gateway is the path that
+        still delivers ``true`` to radar-en. A short timeout keeps an
+        asleep lamp from blocking the switch.
+        """
+        if self._ctrl_mode != CtrlMode.AUTO or not props:
+            return None
+        device_gw = self._device_list_gateway.get(did, None)
+        if not (
+            device_gw and device_gw.get('online', False)
+            and device_gw.get('specv2_access', False)
+            and 'group_id' in device_gw
+        ):
+            return None
+        mips = self._mips_local.get(device_gw['group_id'], None)
+        if mips is None:
+            return None
+        codes: list = []
+        for item in props:
+            try:
+                result = await mips.set_prop_async(
+                    did=did, siid=item['siid'], piid=item['piid'],
+                    value=item['value'], timeout_ms=3000)
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                _LOGGER.info(
+                    'gateway set prop missed, %s, %s', did, err)
+                return codes or None
+            codes.append(self._prop_set_code(result))
+            if codes[-1] not in (0, 1):
+                break
+        return codes
+
     async def _race_prop_codes(
         self, did: str, props: list[dict]
     ) -> list:
@@ -953,8 +990,15 @@ class MIoTClient:
         cloud_task = self._main_loop.create_task(
             self._set_props_cloud_async(did, props))
         pending = {direct_task, cloud_task}
+        # A bool such as radar-en is ignored when written as 1. Cloud
+        # rejects true, and UDP from Home Assistant often never arrives.
+        # The gateway still delivers the boolean.
+        if any(isinstance(item.get('value'), bool) for item in props):
+            pending.add(self._main_loop.create_task(
+                self._set_props_gateway_async(did, props)))
         direct_codes: Optional[list] = None
         cloud_codes: Optional[list] = None
+        gateway_codes: Optional[list] = None
         cloud_error: Optional[BaseException] = None
         while pending:
             done, pending = await asyncio.wait(
@@ -976,12 +1020,25 @@ class MIoTClient:
                     return outcome
                 if task is direct_task:
                     direct_codes = outcome
-                else:
+                elif task is cloud_task:
                     cloud_codes = outcome
-        if cloud_error and cloud_codes is None and direct_codes is None:
+                else:
+                    gateway_codes = outcome
+        if (
+            cloud_error and cloud_codes is None
+            and direct_codes is None and gateway_codes is None
+        ):
             raise cloud_error
+        if (
+            cloud_codes
+            and cloud_value_rejected(cloud_codes[0])
+            and gateway_codes
+        ):
+            return gateway_codes
         if cloud_codes is not None:
             return cloud_codes
+        if gateway_codes is not None:
+            return gateway_codes
         return direct_codes or []
 
     async def _set_props_raced_async(
@@ -989,19 +1046,12 @@ class MIoTClient:
     ) -> bool:
         """Run direct miIO and cloud together. First success returns.
 
-        ``on=true`` on the ambient light is a property value error. One
-        retry sends that bool as 1 or 0. The loser is not awaited.
+        Bool values stay bool. Integer 1 is accepted by the cloud and
+        then ignored, which leaves the radar switch off.
         """
         codes = await self._race_prop_codes(did, props)
         if prop_codes_win(codes):
             return True
-        retried = reject_bool_as_int(props, codes)
-        if retried:
-            _LOGGER.info(
-                'bool set prop rejected, retry as int, %s', did)
-            codes = await self._race_prop_codes(did, retried)
-            if prop_codes_win(codes):
-                return True
         _LOGGER.info('raced set props missed, %s, %s', did, codes)
         if codes:
             raise MIoTClientError(

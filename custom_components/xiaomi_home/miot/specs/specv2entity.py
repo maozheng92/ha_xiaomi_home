@@ -733,6 +733,8 @@ SPEC_EVENT_TRANS_MAP: dict[str, str] = {
     'long-press': EventDeviceClass.BUTTON,
     'motion-detected': EventDeviceClass.MOTION,
     'no-motion': EventDeviceClass.MOTION,
+    'moving-true': EventDeviceClass.MOTION,
+    'moving-false': EventDeviceClass.MOTION,
     'doorbell-ring': EventDeviceClass.DOORBELL
 }
 

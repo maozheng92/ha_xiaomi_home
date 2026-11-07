@@ -205,31 +205,6 @@ def prop_codes_win(codes: Optional[list]) -> bool:
         and codes[0] in (0, 1))
 
 
-def reject_bool_as_int(
-    params: list, codes: Optional[list]
-) -> Optional[list]:
-    """Return the same writes with bool values as 0 or 1.
-
-    yeelink.light.lamp39 answers ``on=true`` with property value error
-    on the ambient light. The integer 1 is the value that write accepts.
-    None when there is nothing to retry.
-    """
-    if prop_codes_win(codes):
-        return None
-    if not codes or not any(
-            cloud_value_rejected(code) for code in codes):
-        return None
-    if not any(isinstance(item.get('value'), bool) for item in params):
-        return None
-    retried = []
-    for item in params:
-        value = item.get('value')
-        if isinstance(value, bool):
-            value = int(value)
-        retried.append({**item, 'value': value})
-    return retried
-
-
 def cloud_value_rejected(rc: Optional[int]) -> bool:
     """Return True when the value itself was rejected.
 

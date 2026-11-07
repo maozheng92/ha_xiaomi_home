@@ -959,11 +959,14 @@ class MipsCloudClient(_MipsClient):
                 not isinstance(msg.get('params', None), dict)
                 or 'siid' not in msg['params']
                 or 'eiid' not in msg['params']
-                or 'arguments' not in msg['params']
             ):
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
+            # moving-true / moving-false have no arguments. Dropping
+            # those messages makes the lamp radar look dead in HA.
+            if 'arguments' not in msg['params']:
+                msg['params']['arguments'] = []
             if handler:
                 self.log_debug('on on_event_msg, %s', payload)
                 msg['params']['from'] = 'cloud'

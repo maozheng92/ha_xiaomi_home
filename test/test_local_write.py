@@ -76,19 +76,13 @@ def test_miio_result_ok():
 
 
 @pytest.mark.github
-def test_ambient_on_retries_bool_as_int():
-    from miot.common import prop_codes_win, reject_bool_as_int
+def test_prop_codes_win():
+    from miot.common import prop_codes_win
 
-    params = [{'siid': 4, 'piid': 1, 'value': True}]
     assert prop_codes_win([0, -704220043]) is True
     assert prop_codes_win([-704220043]) is False
     assert prop_codes_win([]) is False
     assert prop_codes_win(None) is False
-    retried = reject_bool_as_int(params, [-704220043])
-    assert retried == [{'siid': 4, 'piid': 1, 'value': 1}]
-    assert reject_bool_as_int(params, [0]) is None
-    assert reject_bool_as_int(
-        [{'siid': 4, 'piid': 1, 'value': 1}], [-704220043]) is None
 
 
 @pytest.mark.github
