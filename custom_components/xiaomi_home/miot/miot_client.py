@@ -59,7 +59,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher, get_system_info_str, slugify_did
+from .common import (
+    MIoTMatcher, get_system_info_str, local_write_needs_cloud, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -668,7 +669,10 @@ class MIoTClient:
     ) -> bool:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
-        # Priority local control
+        # Priority local control. A Wi-Fi device that has been idle often
+        # answers -9999 (user ack timeout) on the gateway; cloud still works.
+        local_unacked = False
+        local_rc: Optional[int] = None
         if self._ctrl_mode == CtrlMode.AUTO:
             # Gateway control
             device_gw = self._device_list_gateway.get(did, None)
@@ -692,11 +696,23 @@ class MIoTClient:
                         'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
                     if rc in [0, 1]:
                         return True
-                    raise MIoTClientError(
-                        self.__get_exec_error_with_rc(rc=rc))
-            # Lan control
+                    if not local_write_needs_cloud(rc):
+                        raise MIoTClientError(
+                            self.__get_exec_error_with_rc(rc=rc))
+                    local_unacked = True
+                    local_rc = rc
+                    _LOGGER.info(
+                        'gateway set prop unacked, try cloud, '
+                        '%s.%d.%d, code=%s',
+                        did, siid, piid, rc)
+            # Lan control. Skip it after a gateway timeout so turn-on does
+            # not wait for a second local failure.
             device_lan = self._device_list_lan.get(did, None)
-            if device_lan and device_lan.get('online', False):
+            if (
+                not local_unacked
+                and device_lan
+                and device_lan.get('online', False)
+            ):
                 result = await self._miot_lan.set_prop_async(
                     did=did, siid=siid, piid=piid, value=value)
                 _LOGGER.debug(
@@ -706,8 +722,14 @@ class MIoTClient:
                     'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
                 if rc in [0, 1]:
                     return True
-                raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
+                if not local_write_needs_cloud(rc):
+                    raise MIoTClientError(
+                        self.__get_exec_error_with_rc(rc=rc))
+                local_unacked = True
+                local_rc = rc
+                _LOGGER.info(
+                    'lan set prop unacked, try cloud, %s.%d.%d, code=%s',
+                    did, siid, piid, rc)
 
         # Cloud control
         device_cloud = self._device_list_cloud.get(did, None)
@@ -733,7 +755,11 @@ class MIoTClient:
                 raise MIoTClientError(
                     self.__get_exec_error_with_rc(rc=rc))
 
-        # Show error message
+        # Cloud had no answer. Keep the local timeout code when that is why
+        # control left the gateway or LAN.
+        if local_unacked and local_rc is not None:
+            raise MIoTClientError(
+                self.__get_exec_error_with_rc(rc=local_rc))
         raise MIoTClientError(
             f'{self._i18n.translate("miot.client.device_exec_error")}, '
             f'{self._i18n.translate("error.common.-10007")}')

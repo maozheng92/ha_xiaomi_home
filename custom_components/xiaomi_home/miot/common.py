@@ -103,6 +103,17 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
+def local_write_needs_cloud(rc: Optional[int]) -> bool:
+    """Return True when a local write should be retried in the cloud.
+
+    -9999 is the device reply "user ack timeout". yeelink.light.lamp39
+    returns it through the central gateway after the lamp has been idle,
+    so writing ``on`` fails while Mi Home, which uses cloud, still works.
+    -10006 is the gateway request timeout for the same case.
+    """
+    return rc in (-9999, -10006)
+
+
 class MIoTMatcher(MQTTMatcher):
     """MIoT Pub/Sub topic matcher."""
 
