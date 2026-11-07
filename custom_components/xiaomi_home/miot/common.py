@@ -152,6 +152,28 @@ def should_start_cloud_write(
     return local_write_needs_cloud(rc)
 
 
+def miio_result_ok(reply: Any) -> bool:
+    """Return True when a legacy Yeelight or miIO call succeeded.
+
+    ``bg_set_power`` answers ``{"result": ["ok"]}``. Spec actions answer
+    a result object whose code is 0 or 1. An ``error`` field is a miss.
+    """
+    if not isinstance(reply, dict) or reply.get('error'):
+        return False
+    result = reply.get('result')
+    if result in (['ok'], 'ok', True):
+        return True
+    if isinstance(result, dict) and result.get('code') in (0, 1):
+        return True
+    if isinstance(result, list) and result:
+        first = result[0]
+        if first in ('ok', 0, 1):
+            return True
+        if isinstance(first, dict) and first.get('code') in (0, 1):
+            return True
+    return reply.get('code') in (0, 1)
+
+
 def prop_codes_win(codes: Optional[list]) -> bool:
     """Return True when the first property write was accepted.
 

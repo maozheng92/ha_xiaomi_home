@@ -1009,6 +1009,40 @@ class MIoTClient:
         self._raise_no_link()
         return False
 
+    async def set_prop_direct_only_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        """Write one property to the lamp IP. Cloud is not asked.
+
+        The cloud validator rejects ambient ``on=true``. A direct write
+        can still apply it, and a cloud error must not hide that.
+        """
+        if did not in self._device_list_cache:
+            return False
+        codes = await self._set_props_direct_async(
+            did, [{'siid': siid, 'piid': piid, 'value': value}])
+        return prop_codes_win(codes)
+
+    async def try_cloud_action_async(
+        self, did: str, siid: int, aiid: int
+    ) -> bool:
+        """Call one spec action through Xiaomi cloud, not the gateway."""
+        if did not in self._device_list_cache:
+            return False
+        device_cloud = self._device_list_cloud.get(did, None)
+        if not device_cloud or not device_cloud.get('online', False):
+            return False
+        try:
+            result = await self._http.action_async(
+                did=did, siid=siid, aiid=aiid, in_list=[])
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info(
+                'cloud action missed, %s.%d.%d, %s', did, siid, aiid, err)
+            return False
+        rc = (result or {}).get(
+            'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
+        return rc in (0, 1)
+
     async def set_props_async(self, did: str, props: list[dict]) -> bool:
         """Write several properties. Yeelight sends them in one request."""
         if did not in self._device_list_cache:
@@ -1217,6 +1251,25 @@ class MIoTClient:
                 except MIoTLanError as err:
                     _LOGGER.info(
                         'lan miio failed, try direct, %s, %s', did, err)
+        token = info.get('token') or cloud.get('token')
+        ip = info.get('local_ip') or cloud.get('local_ip')
+        return await miio_rpc_async(
+            did=did, token=token, method=method, params=params,
+            ip=ip, timeout_ms=timeout_ms, retry_count=retry_count)
+
+    async def call_yeelight_async(
+        self, did: str, method: str, params: Any,
+        timeout_ms: int = 1200, retry_count: int = 1
+    ) -> dict:
+        """Send a classic Yeelight method straight to the lamp.
+
+        ``bg_set_power`` is not a spec property. The MIoT LAN service
+        does not speak it, so this skips that service and the gateway.
+        """
+        if did not in self._device_list_cache:
+            raise MIoTClientError(f'did not exist, {did}')
+        info = self._device_list_cache.get(did) or {}
+        cloud = self._device_list_cloud.get(did) or {}
         token = info.get('token') or cloud.get('token')
         ip = info.get('local_ip') or cloud.get('local_ip')
         return await miio_rpc_async(

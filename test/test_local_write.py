@@ -49,6 +49,20 @@ def test_prefers_cloud_write():
 
 
 @pytest.mark.github
+def test_miio_result_ok():
+    from miot.common import miio_result_ok
+
+    assert miio_result_ok({'result': ['ok']}) is True
+    assert miio_result_ok({'result': {'code': 0, 'out': []}}) is True
+    assert miio_result_ok({'code': 0}) is True
+    assert miio_result_ok({
+        'error': {'code': -5001, 'message': 'method not found'},
+    }) is False
+    assert miio_result_ok({'result': []}) is False
+    assert miio_result_ok(None) is False
+
+
+@pytest.mark.github
 def test_ambient_on_retries_bool_as_int():
     from miot.common import prop_codes_win, reject_bool_as_int
 
