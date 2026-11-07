@@ -50,6 +50,7 @@ import logging
 from typing import Any, Optional
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.water_heater import (STATE_ON, STATE_OFF,
@@ -96,7 +97,7 @@ class WaterHeater(MIoTServiceEntity, WaterHeaterEntity):
                  entity_data: MIoTEntityData) -> None:
         """Initialize the Water heater."""
         super().__init__(miot_device=miot_device, entity_data=entity_data)
-        self._attr_temperature_unit = None
+        self._attr_native_temperature_unit = None
         self._attr_supported_features = WaterHeaterEntityFeature(0)
         self._prop_on = None
         self._prop_temp = None
@@ -117,7 +118,7 @@ class WaterHeater(MIoTServiceEntity, WaterHeaterEntity):
                                   self.entity_id)
                     continue
                 if prop.external_unit:
-                    self._attr_temperature_unit = prop.external_unit
+                    self._attr_native_temperature_unit = prop.external_unit
                 self._prop_temp = prop
             # target-temperature
             if prop.name == 'target-temperature':
@@ -129,8 +130,11 @@ class WaterHeater(MIoTServiceEntity, WaterHeaterEntity):
                 self._attr_min_temp = prop.value_range.min_
                 self._attr_max_temp = prop.value_range.max_
                 self._attr_target_temperature_step = prop.value_range.step
-                if self._attr_temperature_unit is None and prop.external_unit:
-                    self._attr_temperature_unit = prop.external_unit
+                if (
+                    self._attr_native_temperature_unit is None
+                    and prop.external_unit
+                ):
+                    self._attr_native_temperature_unit = prop.external_unit
                 self._attr_supported_features |= (
                     WaterHeaterEntityFeature.TARGET_TEMPERATURE)
                 self._prop_target_temp = prop
@@ -146,6 +150,8 @@ class WaterHeater(MIoTServiceEntity, WaterHeaterEntity):
             self._attr_operation_list = [STATE_ON]
         self._attr_operation_list.append(STATE_OFF)
         self._attr_supported_features |= WaterHeaterEntityFeature.OPERATION_MODE
+        if not self._attr_native_temperature_unit:
+            self._attr_native_temperature_unit = UnitOfTemperature.CELSIUS
 
     async def async_turn_on(self) -> None:
         """Turn the water heater on."""
@@ -178,13 +184,13 @@ class WaterHeater(MIoTServiceEntity, WaterHeaterEntity):
                                           value=operation_mode))
 
     @property
-    def current_temperature(self) -> Optional[float]:
+    def native_current_temperature(self) -> Optional[float]:
         """The current temperature."""
         return (None if self._prop_temp is None else self.get_prop_value(
             prop=self._prop_temp))
 
     @property
-    def target_temperature(self) -> Optional[float]:
+    def native_target_temperature(self) -> Optional[float]:
         """The target temperature."""
         return (None if self._prop_target_temp is None else self.get_prop_value(
             prop=self._prop_target_temp))
