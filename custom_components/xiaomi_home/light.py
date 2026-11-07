@@ -46,7 +46,6 @@ off Xiaomi or its affiliates' products.
 Light entities for Xiaomi Home.
 """
 from __future__ import annotations
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -76,15 +75,6 @@ from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _log_task_error(task: asyncio.Task) -> None:
-    """Read a leftover task so a late failure is not lost."""
-    if task.cancelled():
-        return
-    err = task.exception()
-    if err:
-        _LOGGER.info('ambient turn on task missed, %s', err)
 
 
 async def async_setup_entry(
@@ -323,22 +313,6 @@ class Light(MIoTServiceEntity, LightEntity):
                 return action
         return None
 
-    async def _call_miio(self, method: str, params: list) -> bool:
-        """Send one legacy Yeelight method to the lamp IP."""
-        try:
-            reply = await self.miot_device.miot_client.call_yeelight_async(
-                did=self.miot_device.did,
-                method=method,
-                params=params,
-                timeout_ms=direct_write_timeout_ms(),
-                retry_count=1)
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            _LOGGER.info(
-                '%s missed, %s, %s', method, self.entity_id, err)
-            return False
-        _LOGGER.info('%s reply, %s, %s', method, self.entity_id, reply)
-        return miio_result_ok(reply)
-
     def _remember_ambient(self, on: bool, level: Optional[int]) -> None:
         if not self._prop_on:
             return
@@ -347,71 +321,59 @@ class Light(MIoTServiceEntity, LightEntity):
         if level is not None and self._prop_brightness:
             self.set_prop_value(self._prop_brightness, level)
 
-    async def _bg_power(self, on: bool) -> bool:
-        """Turn only the fill light on or off.
+    async def _toggle_ambient(self) -> Optional[str]:
+        """Toggle the fill light. None means the lamp accepted it.
 
-        Integer 1 is accepted and then ignored. ``on=true`` is a cloud
-        property value error. ``bg_set_power`` is the Yeelight command
-        for the background channel and does not switch the main lamp.
-        """
-        power = 'on' if on else 'off'
-        return await self._call_miio(
-            'bg_set_power', [power, 'sudden', 0])
-
-    async def _turn_on_ambient(self, **kwargs) -> Optional[bool]:
-        """Turn the fill light on.
-
-        Returns whether brightness was written, or None when no command
-        was accepted.
+        ``on=true`` is a property value error, and integer 1 is accepted
+        without turning the fill light on. ``bg_set_power`` is not this
+        lamp's command. The ambient service action is the switch.
         """
         if not self._prop_on:
-            return None
-        level = self._on_with_bright_level(
-            self._prop_brightness or self._prop_on, kwargs)
-        client = self.miot_device.miot_client
-        bg_task = asyncio.create_task(self._bg_power(True))
-        direct_task = asyncio.create_task(
-            client.set_prop_direct_only_async(
-                did=self.miot_device.did,
-                siid=self._prop_on.service.iid,
-                piid=self._prop_on.iid,
-                value=True))
-        pending = {bg_task, direct_task}
-        bg_ok = False
-        direct_ok = False
-        while pending and not (bg_ok or direct_ok):
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                try:
-                    ok = bool(task.result())
-                except Exception:  # pylint: disable=broad-exception-caught
-                    ok = False
-                if task is bg_task:
-                    bg_ok = ok
-                else:
-                    direct_ok = ok
-        for task in pending:
-            task.add_done_callback(_log_task_error)
-        if bg_ok:
-            wrote_level = None
-            if ATTR_BRIGHTNESS in kwargs:
-                if await self._call_miio(
-                        'bg_set_bright', [int(level), 'sudden', 0]):
-                    wrote_level = int(level)
-            self._remember_ambient(True, wrote_level)
-            return wrote_level is not None
-        if direct_ok:
-            self._remember_ambient(True, None)
-            return False
+            return 'no on property'
         toggle = self._ambient_toggle()
-        if toggle is not None and await client.try_cloud_action_async(
+        siid = self._prop_on.service.iid
+        aiid = toggle.iid if toggle is not None else 2
+        if toggle is not None:
+            siid = toggle.service.iid
+        client = self.miot_device.miot_client
+        params = {
+            'did': str(self.miot_device.did),
+            'siid': siid,
+            'aiid': aiid,
+            'in': [],
+        }
+        try:
+            reply = await client.call_yeelight_async(
                 did=self.miot_device.did,
-                siid=toggle.service.iid,
-                aiid=toggle.iid):
-            self._remember_ambient(True, None)
+                method='action',
+                params=params,
+                timeout_ms=direct_write_timeout_ms(),
+                retry_count=1)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            reply = err
+        if miio_result_ok(reply):
+            return None
+        cloud_ok, cloud_detail = await client.try_cloud_action_async(
+            did=self.miot_device.did, siid=siid, aiid=aiid)
+        if cloud_ok:
+            return None
+        return f'direct={reply}, cloud={cloud_detail}'
+
+    async def _turn_on_ambient(self) -> bool:
+        """Turn the fill light on.
+
+        Returns whether brightness was written with the switch. An
+        already-on fill light is left on so the toggle cannot turn it
+        off. Brightness still follows in the normal property write.
+        """
+        if self.is_on is True:
             return False
-        return None
+        detail = await self._toggle_ambient()
+        if detail is not None:
+            raise MIoTClientError(
+                f'ambient turn on missed, {self.entity_id}, {detail}')
+        self._remember_ambient(True, None)
+        return False
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the light on.
@@ -434,12 +396,8 @@ class Light(MIoTServiceEntity, LightEntity):
                 wrote_on = True
                 wrote_brightness = True
         if self._prop_on and not wrote_on and self._is_ambient_light():
-            ambient_wrote = await self._turn_on_ambient(**kwargs)
-            if ambient_wrote is None:
-                raise MIoTClientError(
-                    f'ambient turn on missed, {self.entity_id}')
+            wrote_brightness = await self._turn_on_ambient()
             wrote_on = True
-            wrote_brightness = ambient_wrote
         # on
         # Dirty logic for lumi.gateway.mgl03 indicator light
         if self._prop_on and not wrote_on:
@@ -483,10 +441,11 @@ class Light(MIoTServiceEntity, LightEntity):
         """Turn the light off."""
         if not self._prop_on:
             return
-        if self._is_ambient_light() and await self._bg_power(False):
-            self._remember_ambient(False, None)
-            self.async_write_ha_state()
-            return
+        if self._is_ambient_light() and self.is_on is True:
+            if await self._toggle_ambient() is None:
+                self._remember_ambient(False, None)
+                self.async_write_ha_state()
+                return
         # Dirty logic for lumi.gateway.mgl03 indicator light
         value_on = False if self._prop_on.format_ == bool else 0
         await self.set_property_async(prop=self._prop_on, value=value_on)

@@ -60,7 +60,7 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, direct_write_timeout_ms,
+    MIoTMatcher, action_result_ok, direct_write_timeout_ms,
     get_system_info_str, local_write_grace_sec, local_write_needs_cloud,
     prefers_cloud_write, prop_codes_win, reject_bool_as_int,
     should_start_cloud_write, slugify_did)
@@ -1009,39 +1009,27 @@ class MIoTClient:
         self._raise_no_link()
         return False
 
-    async def set_prop_direct_only_async(
-        self, did: str, siid: int, piid: int, value: Any
-    ) -> bool:
-        """Write one property to the lamp IP. Cloud is not asked.
-
-        The cloud validator rejects ambient ``on=true``. A direct write
-        can still apply it, and a cloud error must not hide that.
-        """
-        if did not in self._device_list_cache:
-            return False
-        codes = await self._set_props_direct_async(
-            did, [{'siid': siid, 'piid': piid, 'value': value}])
-        return prop_codes_win(codes)
-
     async def try_cloud_action_async(
         self, did: str, siid: int, aiid: int
-    ) -> bool:
-        """Call one spec action through Xiaomi cloud, not the gateway."""
+    ) -> tuple[bool, str]:
+        """Call one spec action through Xiaomi cloud, not the gateway.
+
+        Returns whether it was accepted and the reply or the reason it
+        was not sent.
+        """
         if did not in self._device_list_cache:
-            return False
+            return False, 'did missing'
         device_cloud = self._device_list_cloud.get(did, None)
         if not device_cloud or not device_cloud.get('online', False):
-            return False
+            return False, 'cloud offline'
         try:
             result = await self._http.action_async(
                 did=did, siid=siid, aiid=aiid, in_list=[])
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.info(
                 'cloud action missed, %s.%d.%d, %s', did, siid, aiid, err)
-            return False
-        rc = (result or {}).get(
-            'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-        return rc in (0, 1)
+            return False, str(err)
+        return action_result_ok(result), str(result)
 
     async def set_props_async(self, did: str, props: list[dict]) -> bool:
         """Write several properties. Yeelight sends them in one request."""

@@ -49,6 +49,19 @@ def test_prefers_cloud_write():
 
 
 @pytest.mark.github
+def test_action_result_ok():
+    from miot.common import action_result_ok
+
+    assert action_result_ok({'code': 0, 'out': []}) is True
+    assert action_result_ok({'out': []}) is True
+    assert action_result_ok([{'code': 0, 'out': []}]) is True
+    assert action_result_ok({'code': -704220043, 'out': []}) is False
+    assert action_result_ok({'error': {'code': -5001}}) is False
+    assert action_result_ok([]) is False
+    assert action_result_ok(None) is False
+
+
+@pytest.mark.github
 def test_miio_result_ok():
     from miot.common import miio_result_ok
 

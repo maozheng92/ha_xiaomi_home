@@ -152,6 +152,24 @@ def should_start_cloud_write(
     return local_write_needs_cloud(rc)
 
 
+def action_result_ok(result: Any) -> bool:
+    """Return True when a spec action result was accepted.
+
+    Cloud ``prop/set`` answers a list of property codes. An action
+    answers one object, sometimes wrapped in a list. A result that only
+    carries ``out`` was accepted. An ``error`` field was not.
+    """
+    if isinstance(result, list):
+        if len(result) != 1 or not isinstance(result[0], dict):
+            return False
+        result = result[0]
+    if not isinstance(result, dict) or result.get('error'):
+        return False
+    if 'code' not in result:
+        return 'out' in result
+    return result.get('code') in (0, 1)
+
+
 def miio_result_ok(reply: Any) -> bool:
     """Return True when a legacy Yeelight or miIO call succeeded.
 
