@@ -144,6 +144,21 @@ def should_start_cloud_write(
     return local_write_needs_cloud(rc)
 
 
+def prefers_cloud_write(model: Optional[str]) -> bool:
+    """Return True when a write should skip the local route.
+
+    yeelink.light.* sleeps its Wi-Fi link. A central-gateway write then
+    sits in "user ack timeout" (-9999) for several seconds, and a cloud
+    write started beside it still waits behind that attempt. al-one/
+    hass-xiaomi-miot does not do that: ``miot_cloud_write`` and a failed
+    local state send ``set_properties`` to Xiaomi cloud only, and Yeelight
+    local mode talks to the lamp with ``set_power`` instead of the hub.
+    These models have no direct ``set_power`` path here, so the matching
+    behaviour is a cloud write with no gateway request in front of it.
+    """
+    return bool(model and model.startswith('yeelink.light.'))
+
+
 class MIoTMatcher(MQTTMatcher):
     """MIoT Pub/Sub topic matcher."""
 

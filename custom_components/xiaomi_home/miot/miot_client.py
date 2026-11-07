@@ -61,7 +61,8 @@ from homeassistant.components import zeroconf
 # pylint: disable=relative-beyond-top-level
 from .common import (
     MIoTMatcher, get_system_info_str, local_write_grace_sec,
-    local_write_needs_cloud, should_start_cloud_write, slugify_did)
+    local_write_needs_cloud, prefers_cloud_write, should_start_cloud_write,
+    slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -847,13 +848,43 @@ class MIoTClient:
         self._raise_no_link()
         return False
 
+    async def _set_prop_cloud_only_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> Optional[bool]:
+        """Write through cloud with no local attempt.
+
+        True when cloud accepted the value. None when cloud cannot be
+        used and the caller should try the local route. Other cloud
+        codes are raised here.
+        """
+        _LOGGER.info(
+            'cloud-only set prop, %s.%d.%d', did, siid, piid)
+        rc = await self._set_prop_cloud_async(did, siid, piid, value)
+        if rc in (0, 1):
+            return True
+        if rc is None or local_write_needs_cloud(rc):
+            return None
+        raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
+
     async def set_prop_async(
         self, did: str, siid: int, piid: int, value: Any
     ) -> bool:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
+        model = self._device_list_cache[did].get('model')
+        # Yeelight lamps: cloud first, same as hass-xiaomi-miot
+        # miot_cloud_write. A gateway attempt in front of cloud keeps
+        # the lamp dark until user ack timeout ends.
+        if prefers_cloud_write(model):
+            cloud_only = await self._set_prop_cloud_only_async(
+                did, siid, piid, value)
+            if cloud_only is not None:
+                return cloud_only
+            _LOGGER.info(
+                'cloud set prop missed, try local, %s.%d.%d',
+                did, siid, piid)
         await self._wait_prop_write_tail(did)
-        # Local stays preferred when it answers quickly. An idle Yeelight
+        # Local stays preferred when it answers quickly. An idle device
         # does not, so cloud starts before the gateway ack timeout ends.
         local_task = self._main_loop.create_task(
             self._set_prop_local_async(did, siid, piid, value))

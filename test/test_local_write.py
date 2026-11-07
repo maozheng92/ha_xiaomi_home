@@ -31,3 +31,15 @@ def test_should_start_cloud_write():
     assert should_start_cloud_write(True, 0) is False
     assert should_start_cloud_write(True, 1) is False
     assert should_start_cloud_write(True, -704042011) is False
+
+
+@pytest.mark.github
+def test_prefers_cloud_write():
+    from miot.common import prefers_cloud_write
+
+    assert prefers_cloud_write('yeelink.light.lamp39') is True
+    assert prefers_cloud_write('yeelink.light.lamp27') is True
+    assert prefers_cloud_write('hotata.airer.d10zm') is False
+    assert prefers_cloud_write('yeelink.bhf_light.v1') is False
+    assert prefers_cloud_write(None) is False
+    assert prefers_cloud_write('') is False
