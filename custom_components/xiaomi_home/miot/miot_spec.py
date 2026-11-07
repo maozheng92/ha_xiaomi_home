@@ -46,11 +46,12 @@ off Xiaomi or its affiliates' products.
 MIoT-Spec-V2 parser.
 """
 import asyncio
+import logging
+import math
 import os
 import platform
 import time
 from typing import Any, Optional, Type, Union
-import logging
 from slugify import slugify
 
 # pylint: disable=relative-beyond-top-level
@@ -60,6 +61,29 @@ from .miot_error import MIoTSpecError
 from .miot_storage import MIoTStorage
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _align_int_to_range(
+    value: Any, origin: Any, step: Any, low: Any, high: Any
+) -> int:
+    """Snap an integer property onto its spec grid and keep it in range.
+
+    The grid starts at ``origin`` and advances by ``step``. Rounding a value
+    that sits just past either end (a color-temperature slider often does
+    this) would otherwise leave the grid and the device rejects it.
+    """
+    snapped = origin + round((value - origin) / step) * step
+    if snapped < low:
+        steps = math.ceil((low - origin) / step - 1e-9)
+        snapped = origin + steps * step
+    elif snapped > high:
+        steps = math.floor((high - origin) / step + 1e-9)
+        snapped = origin + steps * step
+    if snapped < low:
+        snapped = low
+    elif snapped > high:
+        snapped = high
+    return int(round(snapped))
 
 
 class MIoTSpecValueRange:
@@ -193,6 +217,13 @@ class MIoTSpecValueList:
     def get_value_by_description(self, description: str) -> Any:
         for item in self.items:
             if item.description == description:
+                return item.value
+        return None
+
+    def get_value_by_name(self, name: str) -> Any:
+        """Return the value whose spec name matches, or None."""
+        for item in self.items:
+            if item.name == name:
                 return item.value
         return None
 
@@ -614,11 +645,14 @@ class MIoTSpecProperty(_MIoTSpecBase):
         if self.format_ == float:
             return round(value, self.precision)
         if self.format_ == int:
-            if self.value_range is None:
+            if self.value_range is None or not self.value_range.step:
                 return int(round(value))
-            return int(
-                round((value - self.value_range.min_) / self.value_range.step) *
-                self.value_range.step + self.value_range.min_)
+            return _align_int_to_range(
+                value,
+                origin=self.value_range.min_,
+                step=self.value_range.step,
+                low=min(self.value_range.min_, self.value_range.max_),
+                high=max(self.value_range.min_, self.value_range.max_))
         return value
 
     def dump(self) -> dict:
