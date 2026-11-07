@@ -144,6 +144,39 @@ def should_start_cloud_write(
     return local_write_needs_cloud(rc)
 
 
+def cloud_value_rejected(rc: Optional[int]) -> bool:
+    """Return True when the value itself was rejected.
+
+    -704220043 and -706012043 are Xiaomi cloud "property value error".
+    -4005 is the same rejection from the device. yeelink.light.lamp39
+    returns it for ``light.on=true``. The turn-on it accepts is the
+    write-only ``yeelight.on-with-bright`` value, 1 to 100.
+    """
+    return rc in (-704220043, -706012043, -4005)
+
+
+def on_with_bright_level(
+    requested: Optional[float],
+    current: Optional[float],
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Pick a legal on-with-bright value.
+
+    A requested brightness wins. Otherwise keep the lamp's last level.
+    With neither, use the top of the range.
+    """
+    level = requested if requested is not None else current
+    if level is None:
+        level = maximum
+    value = int(round(float(level)))
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
 def prefers_cloud_write(model: Optional[str]) -> bool:
     """Return True when a write should skip the local route.
 

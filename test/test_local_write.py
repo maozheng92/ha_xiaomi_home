@@ -43,3 +43,27 @@ def test_prefers_cloud_write():
     assert prefers_cloud_write('yeelink.bhf_light.v1') is False
     assert prefers_cloud_write(None) is False
     assert prefers_cloud_write('') is False
+
+
+@pytest.mark.github
+def test_cloud_value_rejected():
+    from miot.common import cloud_value_rejected
+
+    assert cloud_value_rejected(-704220043) is True
+    assert cloud_value_rejected(-706012043) is True
+    assert cloud_value_rejected(-4005) is True
+    assert cloud_value_rejected(0) is False
+    assert cloud_value_rejected(-9999) is False
+    assert cloud_value_rejected(None) is False
+
+
+@pytest.mark.github
+def test_on_with_bright_level():
+    from miot.common import on_with_bright_level
+
+    assert on_with_bright_level(40, 10, 1, 100) == 40
+    assert on_with_bright_level(None, 10, 1, 100) == 10
+    assert on_with_bright_level(None, None, 1, 100) == 100
+    assert on_with_bright_level(0, 10, 1, 100) == 1
+    assert on_with_bright_level(180, 10, 1, 100) == 100
+    assert on_with_bright_level(40.6, None, 1, 100) == 41

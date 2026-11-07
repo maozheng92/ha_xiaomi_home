@@ -60,9 +60,9 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, get_system_info_str, local_write_grace_sec,
-    local_write_needs_cloud, prefers_cloud_write, should_start_cloud_write,
-    slugify_did)
+    MIoTMatcher, cloud_value_rejected, get_system_info_str,
+    local_write_grace_sec, local_write_needs_cloud, prefers_cloud_write,
+    should_start_cloud_write, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -862,9 +862,43 @@ class MIoTClient:
         rc = await self._set_prop_cloud_async(did, siid, piid, value)
         if rc in (0, 1):
             return True
-        if rc is None or local_write_needs_cloud(rc):
+        # A rejected value must not abort the service. lamp39 answers
+        # "property value error" for on=true; the local route, or
+        # on-with-bright, can still apply the command.
+        if (
+            rc is None
+            or local_write_needs_cloud(rc)
+            or cloud_value_rejected(rc)
+        ):
+            _LOGGER.info(
+                'cloud set prop rejected, try local, %s.%d.%d, code=%s',
+                did, siid, piid, rc)
             return None
         raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
+
+    async def try_set_prop_cloud_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        """Write one property through cloud and do not try local.
+
+        False when cloud did not accept the value. Callers use this for
+        a command that must not be preceded by a gateway request.
+        """
+        if did not in self._device_list_cache:
+            return False
+        try:
+            rc = await self._set_prop_cloud_async(did, siid, piid, value)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info(
+                'cloud set prop failed, %s.%d.%d, %s',
+                did, siid, piid, err)
+            return False
+        if rc in (0, 1):
+            return True
+        _LOGGER.info(
+            'cloud set prop missed, %s.%d.%d, code=%s',
+            did, siid, piid, rc)
+        return False
 
     async def set_prop_async(
         self, did: str, siid: int, piid: int, value: Any

@@ -66,7 +66,8 @@ from homeassistant.util.color import (
     brightness_to_value
 )
 
-from .miot.miot_spec import MIoTSpecProperty
+from .miot.common import on_with_bright_level
+from .miot.miot_spec import MIoTSpecProperty, MIoTSpecService
 from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
 
@@ -245,19 +246,78 @@ class Light(MIoTServiceEntity, LightEntity):
             map_=self._mode_map,
             key=self.get_prop_value(prop=self._prop_mode))
 
+    def _on_with_bright_prop(self) -> Optional[MIoTSpecProperty]:
+        """Return yeelight.on-with-bright for the main light only.
+
+        That property turns the main lamp on at a brightness. Using it
+        for the ambient light turns the main lamp on instead.
+        """
+        spec = self.entity_data.spec
+        if not isinstance(spec, MIoTSpecService) or spec.name != 'light':
+            return None
+        instance = self.miot_device.spec_instance
+        if instance is None:
+            return None
+        for service in instance.services:
+            for prop in service.properties:
+                if prop.name == 'on-with-bright' and prop.writable:
+                    return prop
+        return None
+
+    def _on_with_bright_level(
+        self, prop: MIoTSpecProperty, kwargs: dict
+    ) -> int:
+        requested = None
+        if ATTR_BRIGHTNESS in kwargs and self._brightness_scale:
+            requested = brightness_to_value(
+                self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
+        current = self.get_prop_value(prop=self._prop_brightness)
+        if prop.value_range:
+            minimum = int(prop.value_range.min_)
+            maximum = int(prop.value_range.max_)
+        else:
+            minimum, maximum = 1, 100
+        return on_with_bright_level(
+            requested, current, minimum, maximum)
+
+    async def _cloud_on_with_bright(self, level: int) -> bool:
+        prop = self._on_with_bright_prop()
+        if prop is None:
+            return False
+        return await self.miot_device.miot_client.try_set_prop_cloud_async(
+            did=self.miot_device.did,
+            siid=prop.service.iid,
+            piid=prop.iid,
+            value=level)
+
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the light on.
 
         Shall set attributes in kwargs if applicable.
         """
+        # lamp39 rejects cloud light.on=true with "property value error".
+        # on-with-bright is the turn-on the firmware accepts, and it has
+        # to go to cloud without a gateway request in front of it.
+        wrote_on = False
+        wrote_brightness = False
+        on_with_bright = self._on_with_bright_prop()
+        if self._prop_on and on_with_bright is not None:
+            level = self._on_with_bright_level(on_with_bright, kwargs)
+            if await self._cloud_on_with_bright(level):
+                value_on = True if self._prop_on.format_ == bool else 1
+                self.set_prop_value(self._prop_on, value_on)
+                if self._prop_brightness:
+                    self.set_prop_value(self._prop_brightness, level)
+                wrote_on = True
+                wrote_brightness = True
         # on
         # Dirty logic for lumi.gateway.mgl03 indicator light
-        if self._prop_on:
+        if self._prop_on and not wrote_on:
             value_on = True if self._prop_on.format_ == bool else 1
             await self.set_property_async(
                 prop=self._prop_on, value=value_on)
         # brightness
-        if ATTR_BRIGHTNESS in kwargs:
+        if ATTR_BRIGHTNESS in kwargs and not wrote_brightness:
             brightness = brightness_to_value(
                 self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
             await self.set_property_async(
