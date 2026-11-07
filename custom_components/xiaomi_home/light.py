@@ -247,6 +247,12 @@ class Light(MIoTServiceEntity, LightEntity):
             map_=self._mode_map,
             key=self.get_prop_value(prop=self._prop_mode))
 
+    def _is_ambient_light(self) -> bool:
+        spec = self.entity_data.spec
+        return (
+            isinstance(spec, MIoTSpecService)
+            and spec.name == 'ambient-light')
+
     def _on_with_bright_prop(self) -> Optional[MIoTSpecProperty]:
         """Return yeelight.on-with-bright for the main light only.
 
@@ -296,6 +302,50 @@ class Light(MIoTServiceEntity, LightEntity):
                 'on-with-bright missed, %s, %s', self.entity_id, err)
             return False
 
+    async def _turn_on_ambient(self, **kwargs) -> bool:
+        """Turn the fill light on with an integer switch and brightness.
+
+        ``on=true`` is rejected as a property value error. There is no
+        on-with-bright for this service, and using the main lamp's
+        property turns the main lamp on. Integer 1 plus the brightness
+        is sent in one request. Returns True when brightness was part
+        of that request.
+        """
+        if not self._prop_on:
+            return False
+        level = self._on_with_bright_level(
+            self._prop_brightness or self._prop_on, kwargs)
+        props = [{
+            'siid': self._prop_on.service.iid,
+            'piid': self._prop_on.iid,
+            'value': 1,
+        }]
+        if self._prop_brightness:
+            props.append({
+                'siid': self._prop_brightness.service.iid,
+                'piid': self._prop_brightness.iid,
+                'value': level,
+            })
+        paired = self._prop_brightness is not None
+        try:
+            await self.miot_device.miot_client.set_props_async(
+                self.miot_device.did, props)
+        except MIoTClientError as err:
+            _LOGGER.info(
+                'ambient on with brightness missed, %s, %s',
+                self.entity_id, err)
+            await self.miot_device.miot_client.set_prop_async(
+                did=self.miot_device.did,
+                siid=self._prop_on.service.iid,
+                piid=self._prop_on.iid,
+                value=1)
+            paired = False
+        value_on = True if self._prop_on.format_ == bool else 1
+        self.set_prop_value(self._prop_on, value_on)
+        if paired and self._prop_brightness:
+            self.set_prop_value(self._prop_brightness, level)
+        return paired
+
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the light on.
 
@@ -316,6 +366,9 @@ class Light(MIoTServiceEntity, LightEntity):
                     self.set_prop_value(self._prop_brightness, level)
                 wrote_on = True
                 wrote_brightness = True
+        if self._prop_on and not wrote_on and self._is_ambient_light():
+            wrote_brightness = await self._turn_on_ambient(**kwargs)
+            wrote_on = True
         # on
         # Dirty logic for lumi.gateway.mgl03 indicator light
         if self._prop_on and not wrote_on:
