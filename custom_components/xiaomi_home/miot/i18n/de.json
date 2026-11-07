@@ -127,6 +127,7 @@
             "-4005": "Ungültiger Eigenschaftswert",
             "-4006": "Ungültiger Aktionsparameter",
             "-4007": "Ungültige Geräte-ID",
+            "-9999": "Zeitüberschreitung der Geräteantwort",
             "-704000000": "Unbekannter Fehler",
             "-704010000": "Nicht autorisiert (Gerät wurde möglicherweise gelöscht)",
             "-704014006": "Gerätebeschreibung nicht gefunden",

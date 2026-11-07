@@ -213,6 +213,32 @@ class Light(MIoTServiceEntity, LightEntity):
                 self._attr_supported_color_modes.add(ColorMode.ONOFF)
                 self._attr_color_mode = ColorMode.ONOFF
 
+    async def async_added_to_hass(self) -> None:
+        """Subscribe, then keep reading the bulb while pushes are quiet."""
+        await super().async_added_to_hass()
+        self.__watch_on_prop()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop the bulb read before the entity subscriptions go away."""
+        self.__unwatch_on_prop()
+        await super().async_will_remove_from_hass()
+
+    def __watch_on_prop(self) -> None:
+        if not self._prop_on:
+            return
+        self.miot_device.miot_client.watch_device_prop(
+            did=self.miot_device.did,
+            siid=self._prop_on.service.iid,
+            piid=self._prop_on.iid)
+
+    def __unwatch_on_prop(self) -> None:
+        if not self._prop_on:
+            return
+        self.miot_device.miot_client.unwatch_device_prop(
+            did=self.miot_device.did,
+            siid=self._prop_on.service.iid,
+            piid=self._prop_on.iid)
+
     @property
     def is_on(self) -> Optional[bool]:
         """Return if the light is on."""

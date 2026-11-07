@@ -127,6 +127,7 @@
             "-4005": "Valore della proprietà non valido",
             "-4006": "Parametro dell'azione non valido",
             "-4007": "ID dispositivo non valido",
+            "-9999": "Timeout di risposta del dispositivo",
             "-704000000": "Errore sconosciuto",
             "-704010000": "Non autorizzato (il dispositivo potrebbe essere stato eliminato)",
             "-704014006": "Descrizione del dispositivo non trovata",

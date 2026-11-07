@@ -59,7 +59,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher, get_system_info_str, slugify_did
+from .common import (
+    MIoTMatcher, get_system_info_str, run_control_routes, same_prop_value,
+    should_push_cloud_shadow, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -107,6 +109,17 @@ REFRESH_PROPS_RETRY_DELAY = 3
 REFRESH_CLOUD_DEVICES_DELAY = 6
 REFRESH_CLOUD_DEVICES_RETRY_DELAY = 60
 REFRESH_GATEWAY_DEVICES_DELAY = 3
+# A Yeelight that has been off for a long time drops the first command.
+# Give the radio a moment before the same route is retried.
+DEVICE_TIMEOUT_RETRY_DELAY = 1.0
+# Pushes stop after a long off, so the on property is read from the bulb.
+LOCAL_STATE_POLL_INTERVAL = 8
+# Do not write the cloud shadow again while a failed push is cooling down.
+CLOUD_SHADOW_BACKOFF = 60
+# Ignore a poll that races the command Home Assistant just sent.
+DEVICE_WRITE_QUIET = 3
+# A sleeping bulb does not answer. Wait before asking it again.
+READ_FAIL_QUIET = 30
 
 @dataclass
 class MIoTClientSub:
@@ -253,6 +266,13 @@ class MIoTClient:
         self._device_list_lan = {}
         self._device_list_update_ts = 0
         self._sub_source_list = {}
+        # Wi-Fi devices controlled through the central gateway still
+        # publish property changes to the cloud. This set tracks the
+        # extra cloud subscription kept beside a local one.
+        self._cloud_mirror_subs: set[str] = set()
+        # (did, siid, piid) -> mirrored/fail_at/quiet_until/published
+        self._device_watch: dict[tuple, dict] = {}
+        self._device_poll_timer: Optional[asyncio.TimerHandle] = None
         self._sub_tree = MIoTMatcher()
         self._sub_device_state = {}
 
@@ -409,6 +429,10 @@ class MIoTClient:
             self._refresh_props_timer = None
         self._refresh_props_list.clear()
         self._refresh_props_retry_count = 0
+        if self._device_poll_timer:
+            self._device_poll_timer.cancel()
+            self._device_poll_timer = None
+        self._device_watch.clear()
         # Cloud mips
         self._mips_cloud.unsub_mips_state(
             key=f'{self._uid}-{self._cloud_server}')
@@ -668,9 +692,12 @@ class MIoTClient:
     ) -> bool:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
-        # Priority local control
+        invalid = MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value
+        routes: list = []
+        # Priority local control. A timeout is not fatal: a Yeelight that
+        # has been off for a long time still looks online on the gateway,
+        # answers -9999, and then accepts the same write from the cloud.
         if self._ctrl_mode == CtrlMode.AUTO:
-            # Gateway control
             device_gw = self._device_list_gateway.get(did, None)
             if (
                 device_gw and device_gw.get('online', False)
@@ -683,60 +710,86 @@ class MIoTClient:
                         'no gateway route, %s, try control through cloud',
                         device_gw)
                 else:
-                    result = await mips.set_prop_async(
-                        did=did, siid=siid, piid=piid, value=value)
-                    _LOGGER.debug(
-                        'gateway set prop, %s.%d.%d, %s -> %s',
-                        did, siid, piid, value, result)
-                    rc = (result or {}).get(
-                        'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                    if rc in [0, 1]:
-                        return True
-                    raise MIoTClientError(
-                        self.__get_exec_error_with_rc(rc=rc))
-            # Lan control
+                    async def _gateway(mips=mips) -> Optional[int]:
+                        result = await mips.set_prop_async(
+                            did=did, siid=siid, piid=piid, value=value)
+                        _LOGGER.debug(
+                            'gateway set prop, %s.%d.%d, %s -> %s',
+                            did, siid, piid, value, result)
+                        return (result or {}).get('code', invalid)
+                    routes.append(('gateway', _gateway))
             device_lan = self._device_list_lan.get(did, None)
             if device_lan and device_lan.get('online', False):
-                result = await self._miot_lan.set_prop_async(
-                    did=did, siid=siid, piid=piid, value=value)
-                _LOGGER.debug(
-                    'lan set prop, %s.%d.%d, %s -> %s',
-                    did, siid, piid, value, result)
-                rc = (result or {}).get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return True
-                raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
+                async def _lan() -> Optional[int]:
+                    result = await self._miot_lan.set_prop_async(
+                        did=did, siid=siid, piid=piid, value=value)
+                    _LOGGER.debug(
+                        'lan set prop, %s.%d.%d, %s -> %s',
+                        did, siid, piid, value, result)
+                    return (result or {}).get('code', invalid)
+                routes.append(('lan', _lan))
 
-        # Cloud control
         device_cloud = self._device_list_cloud.get(did, None)
-        if device_cloud and device_cloud.get('online', False):
-            result = await self._http.set_prop_async(
-                params=[
-                    {'did': did, 'siid': siid, 'piid': piid, 'value': value}
-                ])
-            _LOGGER.debug(
-                'cloud set prop, %s.%d.%d, %s -> %s',
-                did, siid, piid, value, result)
-            if result and len(result) == 1:
-                rc = result[0].get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return True
-                if rc in [-704010000, -704042011]:
-                    # Device remove or offline
-                    _LOGGER.error('device may be removed or offline, %s', did)
-                    self._main_loop.create_task(
-                        await self.__refresh_cloud_device_with_dids_async(
-                            dids=[did]))
-                raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
+        # A sleeping light can be marked offline in the cloud cache while
+        # the gateway still accepts the command and then times out. Keep
+        # the cloud route in that case so the retry has somewhere to go.
+        if device_cloud and (
+            device_cloud.get('online', False) or routes
+        ):
+            async def _cloud() -> Optional[int]:
+                result = await self._http.set_prop_async(params=[{
+                    'did': did, 'siid': siid, 'piid': piid, 'value': value,
+                }])
+                _LOGGER.debug(
+                    'cloud set prop, %s.%d.%d, %s -> %s',
+                    did, siid, piid, value, result)
+                if result and len(result) == 1:
+                    return result[0].get('code', invalid)
+                return None
+            routes.append(('cloud', _cloud))
 
-        # Show error message
-        raise MIoTClientError(
-            f'{self._i18n.translate("miot.client.device_exec_error")}, '
-            f'{self._i18n.translate("error.common.-10007")}')
+        def _on_plan(name: str, rc: int, plan: str) -> None:
+            _LOGGER.info(
+                'set prop %s, %s.%d.%d, code=%s, %s',
+                name, did, siid, piid, rc, plan)
+
+        ok, rc, route = await run_control_routes(
+            routes,
+            retry_delay=DEVICE_TIMEOUT_RETRY_DELAY,
+            on_plan=_on_plan)
+        if ok:
+            # A gateway success turns the bulb on and updates Home
+            # Assistant locally. Mi Home reads the cloud shadow, which
+            # stays unchanged when the bulb no longer publishes.
+            if route != 'cloud':
+                self._main_loop.create_task(
+                    self.__mirror_watched_prop(did, siid, piid, value))
+            else:
+                self.__note_device_write(did, siid, piid, value)
+            return True
+        self.__raise_control_error(did, rc)
+
+    def watch_device_prop(self, did: str, siid: int, piid: int) -> None:
+        """Read this property from the bulb when pushes have stopped."""
+        self._device_watch.setdefault((did, siid, piid), {
+            'fail_at': 0.0,
+            'quiet_until': 0.0,
+        })
+        self.__ensure_device_poll(delay=2)
+
+    def unwatch_device_prop(self, did: str, siid: int, piid: int) -> None:
+        self._device_watch.pop((did, siid, piid), None)
+        if not self._device_watch and self._device_poll_timer:
+            self._device_poll_timer.cancel()
+            self._device_poll_timer = None
+
+    def request_device_sync(self, did: str, siid: int, piid: int) -> None:
+        """Read the bulb now and publish the value to Home Assistant."""
+        state = self._device_watch.get((did, siid, piid))
+        if state is None:
+            state = {'fail_at': 0.0, 'quiet_until': 0.0}
+        self._main_loop.create_task(
+            self.__sync_device_prop_async(did, siid, piid, state))
 
     def request_refresh_prop(
         self, did: str, siid: int, piid: int
@@ -800,63 +853,74 @@ class MIoTClient:
     ) -> list:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
+        invalid = MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value
+        routes: list = []
+        holder: dict = {'out': []}
 
         device_gw = self._device_list_gateway.get(did, None)
-        # Priority local control
         if self._ctrl_mode == CtrlMode.AUTO:
             if (
                 device_gw and device_gw.get('online', False)
                 and device_gw.get('specv2_access', False)
                 and 'group_id' in device_gw
             ):
-                mips = self._mips_local.get(
-                    device_gw['group_id'], None)
+                mips = self._mips_local.get(device_gw['group_id'], None)
                 if mips is None:
                     _LOGGER.error('no gw route, %s', device_gw)
                 else:
-                    result = await mips.action_async(
-                        did=did, siid=siid, aiid=aiid, in_list=in_list)
-                    rc = (result or {}).get(
-                        'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                    if rc in [0, 1]:
-                        return result.get('out', [])
-                    raise MIoTClientError(
-                        self.__get_exec_error_with_rc(rc=rc))
-            # Lan control
+                    async def _gateway(mips=mips) -> Optional[int]:
+                        result = await mips.action_async(
+                            did=did, siid=siid, aiid=aiid, in_list=in_list)
+                        rc = (result or {}).get('code', invalid)
+                        if rc in (0, 1):
+                            holder['out'] = (result or {}).get('out', [])
+                        return rc
+                    routes.append(('gateway', _gateway))
             device_lan = self._device_list_lan.get(did, None)
             if device_lan and device_lan.get('online', False):
-                result = await self._miot_lan.action_async(
-                    did=did, siid=siid, aiid=aiid, in_list=in_list)
-                _LOGGER.debug(
-                    'lan action, %s, %s, %s -> %s', did, siid, aiid, result)
-                rc = (result or {}).get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return result.get('out', [])
-                raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
-        # Cloud control
+                async def _lan() -> Optional[int]:
+                    result = await self._miot_lan.action_async(
+                        did=did, siid=siid, aiid=aiid, in_list=in_list)
+                    _LOGGER.debug(
+                        'lan action, %s, %s, %s -> %s',
+                        did, siid, aiid, result)
+                    rc = (result or {}).get('code', invalid)
+                    if rc in (0, 1):
+                        holder['out'] = (result or {}).get('out', [])
+                    return rc
+                routes.append(('lan', _lan))
+
         device_cloud = self._device_list_cloud.get(did, None)
-        if device_cloud and device_cloud.get('online', False):
-            result: dict = await self._http.action_async(
-                did=did, siid=siid, aiid=aiid, in_list=in_list)
-            if result:
-                rc = result.get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return result.get('out', [])
-                if rc in [-704010000, -704042011]:
-                    # Device remove or offline
-                    _LOGGER.error('device removed or offline, %s', did)
-                    self._main_loop.create_task(
-                        await self.__refresh_cloud_device_with_dids_async(
-                            dids=[did]))
-                raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
-        # TODO: Show error message
-        _LOGGER.error(
-            'client action failed, %s.%d.%d', did, siid, aiid)
-        return []
+        if device_cloud and (
+            device_cloud.get('online', False) or routes
+        ):
+            async def _cloud() -> Optional[int]:
+                result: dict = await self._http.action_async(
+                    did=did, siid=siid, aiid=aiid, in_list=in_list)
+                if not result:
+                    return None
+                rc = result.get('code', invalid)
+                if rc in (0, 1):
+                    holder['out'] = result.get('out', [])
+                return rc
+            routes.append(('cloud', _cloud))
+
+        def _on_plan(name: str, rc: int, plan: str) -> None:
+            _LOGGER.info(
+                'action %s, %s.%d.%d, code=%s, %s',
+                name, did, siid, aiid, rc, plan)
+
+        ok, rc, _ = await run_control_routes(
+            routes,
+            retry_delay=DEVICE_TIMEOUT_RETRY_DELAY,
+            on_plan=_on_plan)
+        if ok:
+            return holder['out'] or []
+        if rc is None:
+            _LOGGER.error(
+                'client action failed, %s.%d.%d', did, siid, aiid)
+            return []
+        self.__raise_control_error(did, rc)
 
     async def call_miio_async(
         self, did: str, method: str, params: Any,
@@ -969,6 +1033,7 @@ class MIoTClient:
         # Unsub
         if sub_from:
             self.__unsub_from(sub_from, did)
+        self.__drop_cloud_mirror(did)
         # Storage
         await self._storage.save_async(
             domain='miot_devices',
@@ -983,6 +1048,201 @@ class MIoTClient:
             if did_tag == d_tag:
                 await self.remove_device_async(did)
                 break
+
+    def __ensure_device_poll(self, delay: float) -> None:
+        if self._device_poll_timer or not self._device_watch:
+            return
+        self._device_poll_timer = self._main_loop.call_later(
+            delay, self.__device_poll_tick)
+
+    def __device_poll_tick(self) -> None:
+        self._device_poll_timer = None
+        self._main_loop.create_task(self.__poll_device_props_async())
+
+    async def __poll_device_props_async(self) -> None:
+        try:
+            now = time.monotonic()
+            for (did, siid, piid), state in list(self._device_watch.items()):
+                if state.get('quiet_until', 0) > now:
+                    continue
+                online = self._device_list_cache.get(did, {}).get(
+                    'online', None)
+                if online is False:
+                    continue
+                try:
+                    await self.__sync_device_prop_async(
+                        did, siid, piid, state)
+                except Exception as err:  # pylint: disable=broad-exception-caught
+                    _LOGGER.debug('device prop sync failed, %s, %s', did, err)
+        finally:
+            if self._device_watch:
+                self.__ensure_device_poll(LOCAL_STATE_POLL_INTERVAL)
+
+    async def __sync_device_prop_async(
+        self, did: str, siid: int, piid: int, state: dict
+    ) -> None:
+        live = await self.__read_device_prop_async(did, siid, piid)
+        if live is None:
+            state['quiet_until'] = time.monotonic() + READ_FAIL_QUIET
+            return
+        if (
+            'published' not in state
+            or not same_prop_value(state['published'], live)
+        ):
+            state['published'] = live
+            self.__on_prop_msg(
+                params={
+                    'did': did, 'siid': siid, 'piid': piid, 'value': live,
+                },
+                ctx=None)
+        shadow = await self.__read_cloud_cache_async(did, siid, piid)
+        if not should_push_cloud_shadow(
+            live, shadow, state.get('fail_at', 0.0),
+            time.monotonic(), CLOUD_SHADOW_BACKOFF
+        ):
+            return
+        confirmed = await self.__read_device_prop_async(did, siid, piid)
+        if confirmed is None or not same_prop_value(live, confirmed):
+            return
+        if await self.__write_cloud_shadow_async(
+                did, siid, piid, confirmed):
+            state['fail_at'] = 0.0
+            return
+        state['fail_at'] = time.monotonic()
+
+    async def __read_device_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        """Read the bulb. The cloud cache is not the source of truth."""
+        if self._ctrl_mode == CtrlMode.AUTO:
+            gateway = await self.__read_gateway_prop_async(did, siid, piid)
+            if gateway is not None:
+                return gateway
+            lan = await self.__read_lan_prop_async(did, siid, piid)
+            if lan is not None:
+                return lan
+        return await self.__read_cloud_prop_async(did, siid, piid, datasource=2)
+
+    async def __read_gateway_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        device_gw = self._device_list_gateway.get(did, None)
+        if not (
+            device_gw and device_gw.get('online', False)
+            and device_gw.get('specv2_access', False)
+            and 'group_id' in device_gw
+        ):
+            return None
+        mips = self._mips_local.get(device_gw['group_id'], None)
+        if mips is None:
+            return None
+        try:
+            return await mips.get_prop_async(
+                did=did, siid=siid, piid=piid, timeout_ms=4000)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug('gateway prop read failed, %s, %s', did, err)
+            return None
+
+    async def __read_lan_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        device_lan = self._device_list_lan.get(did, None)
+        if not device_lan or not device_lan.get('online', False):
+            return None
+        try:
+            return await self._miot_lan.get_prop_async(
+                did=did, siid=siid, piid=piid, timeout_ms=4000)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug('lan prop read failed, %s, %s', did, err)
+            return None
+
+    async def __read_cloud_cache_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        return await self.__read_cloud_prop_async(
+            did, siid, piid, datasource=1)
+
+    async def __read_cloud_prop_async(
+        self, did: str, siid: int, piid: int, datasource: int
+    ) -> Any:
+        if not self._network.network_status:
+            return None
+        try:
+            results = await self._http.get_props_async(
+                params=[{'did': did, 'siid': siid, 'piid': piid}],
+                datasource=datasource)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug(
+                'cloud prop read failed, %s, source %s, %s',
+                did, datasource, err)
+            return None
+        if (
+            not results
+            or not isinstance(results[0], dict)
+            or 'value' not in results[0]
+        ):
+            return None
+        return results[0]['value']
+
+    async def __write_cloud_shadow_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        if did not in self._device_list_cloud:
+            return False
+        if not self._network.network_status:
+            return False
+        try:
+            result = await self._http.set_prop_async(params=[{
+                'did': did, 'siid': siid, 'piid': piid, 'value': value,
+            }])
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info('cloud shadow update failed, %s, %s', did, err)
+            return False
+        if not result or result[0].get('code') not in (0, 1):
+            _LOGGER.info(
+                'cloud shadow update rejected, %s.%d.%d, %s',
+                did, siid, piid, result)
+            return False
+        return True
+
+    async def __mirror_watched_prop(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> None:
+        state = self._device_watch.get((did, siid, piid))
+        if state is None:
+            return
+        self.__note_device_write(did, siid, piid, value)
+        if await self.__write_cloud_shadow_async(did, siid, piid, value):
+            state['fail_at'] = 0.0
+        else:
+            state['fail_at'] = time.monotonic()
+
+    def __note_device_write(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> None:
+        state = self._device_watch.get((did, siid, piid))
+        if state is None:
+            return
+        state['published'] = value
+        state['quiet_until'] = time.monotonic() + DEVICE_WRITE_QUIET
+
+    def __raise_control_error(
+        self, did: str, rc: Optional[int]
+    ) -> None:
+        """Raise the execution error for a failed set or action.
+
+        Device-removed and device-offline codes refresh the cloud cache
+        before the error is raised.
+        """
+        if rc in (-704010000, -704042011):
+            _LOGGER.error('device may be removed or offline, %s', did)
+            self._main_loop.create_task(
+                self.__refresh_cloud_device_with_dids_async(dids=[did]))
+        if rc is None:
+            raise MIoTClientError(
+                f'{self._i18n.translate("miot.client.device_exec_error")}, '
+                f'{self._i18n.translate("error.common.-10007")}')
+        raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
 
     def __get_exec_error_with_rc(self, rc: int) -> str:
         err_msg: str = self._i18n.translate(
@@ -1076,7 +1336,9 @@ class MIoTClient:
         ):
             from_new = 'cloud'
         if (from_new == from_old) and (from_new=='cloud' or from_new=='lan'):
-            # No need to update
+            # No need to update the primary source. The cloud mirror
+            # still follows online state.
+            self.__sync_cloud_mirror(did, from_new)
             return
         # Unsub old
         if from_old:
@@ -1084,8 +1346,45 @@ class MIoTClient:
         # Sub new
         self.__sub_from(from_new, did)
         self._sub_source_list[did] = from_new
+        self.__sync_cloud_mirror(did, from_new)
         _LOGGER.info(
             'device sub changed, %s, from %s to %s', did, from_old, from_new)
+
+    @final
+    def __sync_cloud_mirror(
+        self, did: str, source: Optional[str]
+    ) -> None:
+        """Keep cloud pushes when the primary source is local.
+
+        A Wi-Fi light reached through the central gateway reports
+        changes to the cloud. After the radio sleeps, the gateway stops
+        forwarding those pushes while Mi Home still receives them, so
+        Home Assistant drifts. The mirror subscription closes that gap.
+        """
+        cloud = self._device_list_cloud.get(did) or {}
+        want = source not in (None, 'cloud') and cloud.get('online', False)
+        has = did in self._cloud_mirror_subs
+        if want and not has and self._mips_cloud is not None:
+            self._mips_cloud.sub_prop(did=did, handler=self.__on_prop_msg)
+            self._mips_cloud.sub_event(did=did, handler=self.__on_event_msg)
+            self._cloud_mirror_subs.add(did)
+            _LOGGER.info(
+                'cloud state mirror on, %s, primary %s', did, source)
+            return
+        if not want and has:
+            self._cloud_mirror_subs.discard(did)
+            # The primary cloud subscription owns this topic now.
+            if source != 'cloud':
+                self.__drop_cloud_mirror(did, forget=False)
+
+    @final
+    def __drop_cloud_mirror(self, did: str, forget: bool = True) -> None:
+        if forget:
+            self._cloud_mirror_subs.discard(did)
+        if self._mips_cloud is None or did in self._cloud_mirror_subs:
+            return
+        self._mips_cloud.unsub_prop(did=did)
+        self._mips_cloud.unsub_event(did=did)
 
     @final
     async def __on_network_status_changed(self, status: bool) -> None:

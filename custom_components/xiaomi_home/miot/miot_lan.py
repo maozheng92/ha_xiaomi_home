@@ -70,7 +70,8 @@ from .miot_error import MIoTError, MIoTLanError, MIoTErrorCode
 from .miot_network import InterfaceStatus, MIoTNetwork, NetworkInfo
 from .miot_mdns import MipsService, MipsServiceState
 from .common import (
-    randomize_float, load_yaml_file, gen_absolute_path, MIoTMatcher)
+    randomize_float, load_yaml_file, gen_absolute_path, MIoTMatcher,
+    with_did)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -1328,27 +1329,34 @@ class MIoTLan:
         _LOGGER.debug('lan message, %s, %s', did, msg)
         if msg['method'] == 'properties_changed':
             for param in msg['params']:
-                if 'siid' not in param and 'piid' not in param:
+                if (
+                    not isinstance(param, dict)
+                    or 'siid' not in param
+                    or 'piid' not in param
+                ):
                     _LOGGER.debug(
                         'invalid message, no siid or piid, %s, %s', did, msg)
                     continue
                 key = f'{did}/p/{param["siid"]}/{param["piid"]}'
                 subs: list[_MIoTLanRegisterBroadcastData] = list(
                     self._device_msg_matcher.iter_match(key))
+                notified = with_did(param, did)
                 for sub in subs:
                     self._main_loop.call_soon_threadsafe(
-                        sub.handler, param, sub.handler_ctx)
+                        sub.handler, notified, sub.handler_ctx)
         elif (
                 msg['method'] == 'event_occured'
+                and isinstance(msg['params'], dict)
                 and 'siid' in msg['params']
                 and 'eiid' in msg['params']
         ):
-            key = f'{did}/e/{msg["params"]["siid"]}/{msg["params"]["eiid"]}'
+            params = with_did(msg['params'], did)
+            key = f'{did}/e/{params["siid"]}/{params["eiid"]}'
             subs: list[_MIoTLanRegisterBroadcastData] = list(
                 self._device_msg_matcher.iter_match(key))
             for sub in subs:
                 self._main_loop.call_soon_threadsafe(
-                    sub.handler, msg['params'], sub.handler_ctx)
+                    sub.handler, params, sub.handler_ctx)
         else:
             _LOGGER.debug(
                 'invalid message, unknown method, %s, %s', did, msg)
