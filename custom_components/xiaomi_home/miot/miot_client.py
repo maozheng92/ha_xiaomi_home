@@ -60,9 +60,9 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, cloud_value_rejected, get_system_info_str,
-    local_write_grace_sec, local_write_needs_cloud, prefers_cloud_write,
-    should_start_cloud_write, slugify_did)
+    MIoTMatcher, cloud_value_rejected, direct_write_timeout_ms,
+    get_system_info_str, local_write_grace_sec, local_write_needs_cloud,
+    prefers_cloud_write, should_start_cloud_write, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -848,56 +848,124 @@ class MIoTClient:
         self._raise_no_link()
         return False
 
-    async def _set_prop_cloud_only_async(
+    async def _set_prop_direct_async(
         self, did: str, siid: int, piid: int, value: Any
-    ) -> Optional[bool]:
-        """Write through cloud with no local attempt.
+    ) -> Optional[int]:
+        """Write straight to the lamp, not through the central gateway.
 
-        True when cloud accepted the value. None when cloud cannot be
-        used and the caller should try the local route. Other cloud
-        codes are raised here.
+        The gateway waits out user ack timeout before the lamp ever sees
+        a later command. hass-xiaomi-miot sends set_properties to the
+        device IP instead, which answers on the LAN round trip.
         """
-        _LOGGER.info(
-            'cloud-only set prop, %s.%d.%d', did, siid, piid)
-        rc = await self._set_prop_cloud_async(did, siid, piid, value)
-        if rc in (0, 1):
-            return True
-        # A rejected value must not abort the service. lamp39 answers
-        # "property value error" for on=true; the local route, or
-        # on-with-bright, can still apply the command.
-        if (
-            rc is None
-            or local_write_needs_cloud(rc)
-            or cloud_value_rejected(rc)
-        ):
-            _LOGGER.info(
-                'cloud set prop rejected, try local, %s.%d.%d, code=%s',
-                did, siid, piid, rc)
+        if self._ctrl_mode != CtrlMode.AUTO:
             return None
-        raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
-
-    async def try_set_prop_cloud_async(
-        self, did: str, siid: int, piid: int, value: Any
-    ) -> bool:
-        """Write one property through cloud and do not try local.
-
-        False when cloud did not accept the value. Callers use this for
-        a command that must not be preceded by a gateway request.
-        """
-        if did not in self._device_list_cache:
-            return False
+        timeout_ms = direct_write_timeout_ms()
+        device_lan = self._device_list_lan.get(did, None)
+        if (
+            device_lan and device_lan.get('online', False)
+            and self._miot_lan.init_done
+        ):
+            try:
+                result = await self._miot_lan.set_prop_async(
+                    did=did, siid=siid, piid=piid, value=value,
+                    timeout_ms=timeout_ms)
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                _LOGGER.info(
+                    'lan set prop missed, %s.%d.%d, %s',
+                    did, siid, piid, err)
+                return None
+            _LOGGER.debug(
+                'lan set prop, %s.%d.%d, %s -> %s',
+                did, siid, piid, value, result)
+            return self._prop_set_code(result)
+        info = self._device_list_cache.get(did) or {}
+        cloud_info = self._device_list_cloud.get(did) or {}
+        token = info.get('token') or cloud_info.get('token')
+        ip = info.get('local_ip') or cloud_info.get('local_ip')
+        if not isinstance(token, str) or not ip:
+            return None
+        params = [{
+            'did': str(did), 'siid': siid, 'piid': piid, 'value': value
+        }]
         try:
-            rc = await self._set_prop_cloud_async(did, siid, piid, value)
+            reply = await miio_rpc_async(
+                did=did, token=token, method='set_properties',
+                params=params, ip=ip, timeout_ms=timeout_ms,
+                retry_count=1)
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.info(
-                'cloud set prop failed, %s.%d.%d, %s',
+                'direct set prop missed, %s.%d.%d, %s',
                 did, siid, piid, err)
+            return None
+        result = reply.get('result') if isinstance(reply, dict) else None
+        if not isinstance(result, list) or not result:
+            return None
+        code = result[0].get(
+            'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
+        _LOGGER.debug(
+            'direct set prop, %s.%d.%d, %s -> %s',
+            did, siid, piid, value, code)
+        return code
+
+    def _prop_write_failed(self, rc: Optional[int]) -> bool:
+        """True when this code should not win ahead of the other path."""
+        if rc is None or rc in (0, 1):
             return False
-        if rc in (0, 1):
-            return True
-        _LOGGER.info(
-            'cloud set prop missed, %s.%d.%d, code=%s',
-            did, siid, piid, rc)
+        return (
+            local_write_needs_cloud(rc) or cloud_value_rejected(rc))
+
+    async def _set_prop_raced_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        """Run direct miIO and cloud together. First success returns.
+
+        The loser is not awaited. Waiting for the cloud ack is what
+        leaves the lamp dark after the LAN command has already applied.
+        """
+        direct_task = self._main_loop.create_task(
+            self._set_prop_direct_async(did, siid, piid, value))
+        cloud_task = self._main_loop.create_task(
+            self._set_prop_cloud_async(did, siid, piid, value))
+        pending = {direct_task, cloud_task}
+        direct_rc: Optional[int] = None
+        cloud_rc: Optional[int] = None
+        cloud_error: Optional[BaseException] = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    outcome = task.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as err:  # pylint: disable=broad-exception-caught
+                    if task is cloud_task:
+                        cloud_error = err
+                    else:
+                        _LOGGER.info(
+                            'direct set prop failed, %s.%d.%d, %s',
+                            did, siid, piid, err)
+                    continue
+                if task is direct_task:
+                    direct_rc = outcome
+                    if direct_rc in (0, 1):
+                        self._detach_prop_tasks(pending)
+                        return True
+                    continue
+                cloud_rc = outcome
+                if cloud_rc in (0, 1):
+                    self._detach_prop_tasks(pending)
+                    return True
+        if cloud_error and cloud_rc is None and direct_rc is None:
+            raise cloud_error
+        rc = cloud_rc if cloud_rc is not None else direct_rc
+        if rc is None or self._prop_write_failed(rc):
+            _LOGGER.info(
+                'raced set prop missed, %s.%d.%d, direct=%s, cloud=%s',
+                did, siid, piid, direct_rc, cloud_rc)
+        if rc is not None:
+            raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
+        self._raise_no_link()
         return False
 
     async def set_prop_async(
@@ -906,17 +974,12 @@ class MIoTClient:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
         model = self._device_list_cache[did].get('model')
-        # Yeelight lamps: cloud first, same as hass-xiaomi-miot
-        # miot_cloud_write. A gateway attempt in front of cloud keeps
-        # the lamp dark until user ack timeout ends.
+        # Yeelight: direct miIO and cloud together, never the gateway.
+        # Cloud alone waits for the sleeping radio to ack, so the lamp
+        # stays dark for that whole round trip.
         if prefers_cloud_write(model):
-            cloud_only = await self._set_prop_cloud_only_async(
+            return await self._set_prop_raced_async(
                 did, siid, piid, value)
-            if cloud_only is not None:
-                return cloud_only
-            _LOGGER.info(
-                'cloud set prop missed, try local, %s.%d.%d',
-                did, siid, piid)
         await self._wait_prop_write_tail(did)
         # Local stays preferred when it answers quickly. An idle device
         # does not, so cloud starts before the gateway ack timeout ends.

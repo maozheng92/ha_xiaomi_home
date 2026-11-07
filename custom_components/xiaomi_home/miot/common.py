@@ -106,6 +106,9 @@ def slugify_did(cloud_server: str, did: str) -> str:
 # Awake gateway writes usually return within this window. An idle
 # Yeelight does not: the hub waits out "user ack timeout" first.
 LOCAL_WRITE_GRACE_SEC = 0.4
+# Direct miIO to the lamp. Longer than one LAN round trip, shorter
+# than the cloud call that waits for a sleeping radio to ack.
+DIRECT_WRITE_TIMEOUT_MS = 1200
 
 
 def local_write_needs_cloud(rc: Optional[int]) -> bool:
@@ -124,6 +127,11 @@ def local_write_needs_cloud(rc: Optional[int]) -> bool:
 def local_write_grace_sec() -> float:
     """Return how long a local write may block before cloud starts."""
     return LOCAL_WRITE_GRACE_SEC
+
+
+def direct_write_timeout_ms() -> int:
+    """Return the direct miIO wait used beside a cloud write."""
+    return DIRECT_WRITE_TIMEOUT_MS
 
 
 def should_start_cloud_write(

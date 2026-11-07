@@ -67,6 +67,7 @@ from homeassistant.util.color import (
 )
 
 from .miot.common import on_with_bright_level
+from .miot.miot_error import MIoTClientError
 from .miot.miot_spec import MIoTSpecProperty, MIoTSpecService
 from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
@@ -284,11 +285,16 @@ class Light(MIoTServiceEntity, LightEntity):
         prop = self._on_with_bright_prop()
         if prop is None:
             return False
-        return await self.miot_device.miot_client.try_set_prop_cloud_async(
-            did=self.miot_device.did,
-            siid=prop.service.iid,
-            piid=prop.iid,
-            value=level)
+        try:
+            return await self.miot_device.miot_client.set_prop_async(
+                did=self.miot_device.did,
+                siid=prop.service.iid,
+                piid=prop.iid,
+                value=level)
+        except MIoTClientError as err:
+            _LOGGER.info(
+                'on-with-bright missed, %s, %s', self.entity_id, err)
+            return False
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the light on.
