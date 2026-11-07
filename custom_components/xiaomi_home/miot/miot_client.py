@@ -60,7 +60,8 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, get_system_info_str, local_write_needs_cloud, slugify_did)
+    MIoTMatcher, get_system_info_str, local_write_grace_sec,
+    local_write_needs_cloud, should_start_cloud_write, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -664,105 +665,180 @@ class MIoTClient:
                 error, traceback.format_exc())
         return False
 
+    @staticmethod
+    def _prop_set_code(result: Any) -> int:
+        if not isinstance(result, dict):
+            return MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value
+        return result.get(
+            'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
+
+    @staticmethod
+    def _consume_prop_task(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug('prop set task ended, %s', err)
+
+    @classmethod
+    def _detach_prop_tasks(cls, tasks: set) -> None:
+        for task in tasks:
+            if task.done():
+                cls._consume_prop_task(task)
+            else:
+                task.add_done_callback(cls._consume_prop_task)
+
+    def _raise_no_link(self) -> None:
+        raise MIoTClientError(
+            f'{self._i18n.translate("miot.client.device_exec_error")}, '
+            f'{self._i18n.translate("error.common.-10007")}')
+
+    async def _set_prop_local_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> Optional[int]:
+        """Return the local result code, or None when no local route."""
+        if self._ctrl_mode != CtrlMode.AUTO:
+            return None
+        device_gw = self._device_list_gateway.get(did, None)
+        if (
+            device_gw and device_gw.get('online', False)
+            and device_gw.get('specv2_access', False)
+            and 'group_id' in device_gw
+        ):
+            mips = self._mips_local.get(device_gw['group_id'], None)
+            if mips is None:
+                _LOGGER.error(
+                    'no gateway route, %s, try control through cloud',
+                    device_gw)
+            else:
+                result = await mips.set_prop_async(
+                    did=did, siid=siid, piid=piid, value=value)
+                _LOGGER.debug(
+                    'gateway set prop, %s.%d.%d, %s -> %s',
+                    did, siid, piid, value, result)
+                return self._prop_set_code(result)
+        device_lan = self._device_list_lan.get(did, None)
+        if device_lan and device_lan.get('online', False):
+            result = await self._miot_lan.set_prop_async(
+                did=did, siid=siid, piid=piid, value=value)
+            _LOGGER.debug(
+                'lan set prop, %s.%d.%d, %s -> %s',
+                did, siid, piid, value, result)
+            return self._prop_set_code(result)
+        return None
+
+    async def _set_prop_cloud_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        """Write one property through Xiaomi cloud."""
+        device_cloud = self._device_list_cloud.get(did, None)
+        if not device_cloud or not device_cloud.get('online', False):
+            return False
+        result = await self._http.set_prop_async(
+            params=[{
+                'did': did, 'siid': siid, 'piid': piid, 'value': value
+            }])
+        _LOGGER.debug(
+            'cloud set prop, %s.%d.%d, %s -> %s',
+            did, siid, piid, value, result)
+        if not result or len(result) != 1:
+            return False
+        rc = result[0].get(
+            'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
+        if rc in (0, 1):
+            return True
+        if rc in (-704010000, -704042011):
+            # Device remove or offline
+            _LOGGER.error('device may be removed or offline, %s', did)
+            self._main_loop.create_task(
+                await self.__refresh_cloud_device_with_dids_async(
+                    dids=[did]))
+        raise MIoTClientError(self.__get_exec_error_with_rc(rc=rc))
+
+    async def _await_prop_writes(
+        self, local_task: asyncio.Task, cloud_task: asyncio.Task,
+        local_rc: Optional[int]
+    ) -> bool:
+        """Return when local or cloud accepts the same write."""
+        pending = {cloud_task}
+        if not local_task.done():
+            pending.add(local_task)
+        cloud_error: Optional[BaseException] = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    outcome = task.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as err:  # pylint: disable=broad-exception-caught
+                    cloud_error = err
+                    continue
+                if task is local_task:
+                    local_rc = outcome
+                    if local_rc in (0, 1):
+                        self._detach_prop_tasks(pending)
+                        return True
+                    if (
+                        local_rc is not None
+                        and not local_write_needs_cloud(local_rc)
+                    ):
+                        self._detach_prop_tasks(pending)
+                        raise MIoTClientError(
+                            self.__get_exec_error_with_rc(rc=local_rc))
+                    continue
+                if outcome is True:
+                    self._detach_prop_tasks(pending)
+                    return True
+        if isinstance(cloud_error, MIoTClientError):
+            raise cloud_error
+        if local_rc is not None and local_write_needs_cloud(local_rc):
+            raise MIoTClientError(
+                self.__get_exec_error_with_rc(rc=local_rc))
+        if cloud_error:
+            raise cloud_error
+        self._raise_no_link()
+        return False
+
     async def set_prop_async(
         self, did: str, siid: int, piid: int, value: Any
     ) -> bool:
         if did not in self._device_list_cache:
             raise MIoTClientError(f'did not exist, {did}')
-        # Priority local control. A Wi-Fi device that has been idle often
-        # answers -9999 (user ack timeout) on the gateway; cloud still works.
-        local_unacked = False
+        # Local stays preferred when it answers quickly. An idle Yeelight
+        # does not, so cloud starts before the gateway ack timeout ends.
+        local_task = self._main_loop.create_task(
+            self._set_prop_local_async(did, siid, piid, value))
+        wait_result = await asyncio.wait(
+            {local_task}, timeout=local_write_grace_sec())
+        done = wait_result[0]
         local_rc: Optional[int] = None
-        if self._ctrl_mode == CtrlMode.AUTO:
-            # Gateway control
-            device_gw = self._device_list_gateway.get(did, None)
+        if local_task in done:
+            local_rc = local_task.result()
+            if local_rc in (0, 1):
+                return True
             if (
-                device_gw and device_gw.get('online', False)
-                and device_gw.get('specv2_access', False)
-                and 'group_id' in device_gw
+                local_rc is not None
+                and not local_write_needs_cloud(local_rc)
             ):
-                mips = self._mips_local.get(device_gw['group_id'], None)
-                if mips is None:
-                    _LOGGER.error(
-                        'no gateway route, %s, try control through cloud',
-                        device_gw)
-                else:
-                    result = await mips.set_prop_async(
-                        did=did, siid=siid, piid=piid, value=value)
-                    _LOGGER.debug(
-                        'gateway set prop, %s.%d.%d, %s -> %s',
-                        did, siid, piid, value, result)
-                    rc = (result or {}).get(
-                        'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                    if rc in [0, 1]:
-                        return True
-                    if not local_write_needs_cloud(rc):
-                        raise MIoTClientError(
-                            self.__get_exec_error_with_rc(rc=rc))
-                    local_unacked = True
-                    local_rc = rc
-                    _LOGGER.info(
-                        'gateway set prop unacked, try cloud, '
-                        '%s.%d.%d, code=%s',
-                        did, siid, piid, rc)
-            # Lan control. Skip it after a gateway timeout so turn-on does
-            # not wait for a second local failure.
-            device_lan = self._device_list_lan.get(did, None)
-            if (
-                not local_unacked
-                and device_lan
-                and device_lan.get('online', False)
-            ):
-                result = await self._miot_lan.set_prop_async(
-                    did=did, siid=siid, piid=piid, value=value)
-                _LOGGER.debug(
-                    'lan set prop, %s.%d.%d, %s -> %s',
-                    did, siid, piid, value, result)
-                rc = (result or {}).get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return True
-                if not local_write_needs_cloud(rc):
-                    raise MIoTClientError(
-                        self.__get_exec_error_with_rc(rc=rc))
-                local_unacked = True
-                local_rc = rc
-                _LOGGER.info(
-                    'lan set prop unacked, try cloud, %s.%d.%d, code=%s',
-                    did, siid, piid, rc)
-
-        # Cloud control
-        device_cloud = self._device_list_cloud.get(did, None)
-        if device_cloud and device_cloud.get('online', False):
-            result = await self._http.set_prop_async(
-                params=[
-                    {'did': did, 'siid': siid, 'piid': piid, 'value': value}
-                ])
-            _LOGGER.debug(
-                'cloud set prop, %s.%d.%d, %s -> %s',
-                did, siid, piid, value, result)
-            if result and len(result) == 1:
-                rc = result[0].get(
-                    'code', MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value)
-                if rc in [0, 1]:
-                    return True
-                if rc in [-704010000, -704042011]:
-                    # Device remove or offline
-                    _LOGGER.error('device may be removed or offline, %s', did)
-                    self._main_loop.create_task(
-                        await self.__refresh_cloud_device_with_dids_async(
-                            dids=[did]))
                 raise MIoTClientError(
-                    self.__get_exec_error_with_rc(rc=rc))
-
-        # Cloud had no answer. Keep the local timeout code when that is why
-        # control left the gateway or LAN.
-        if local_unacked and local_rc is not None:
-            raise MIoTClientError(
-                self.__get_exec_error_with_rc(rc=local_rc))
-        raise MIoTClientError(
-            f'{self._i18n.translate("miot.client.device_exec_error")}, '
-            f'{self._i18n.translate("error.common.-10007")}')
+                    self.__get_exec_error_with_rc(rc=local_rc))
+        if not should_start_cloud_write(local_task.done(), local_rc):
+            self._raise_no_link()
+        if local_task.done():
+            _LOGGER.info(
+                'local set prop unacked, start cloud, %s.%d.%d, code=%s',
+                did, siid, piid, local_rc)
+        else:
+            _LOGGER.info(
+                'local set prop still waiting, start cloud, %s.%d.%d',
+                did, siid, piid)
+        cloud_task = self._main_loop.create_task(
+            self._set_prop_cloud_async(did, siid, piid, value))
+        return await self._await_prop_writes(
+            local_task, cloud_task, local_rc)
 
     def request_refresh_prop(
         self, did: str, siid: int, piid: int

@@ -103,6 +103,11 @@ def slugify_did(cloud_server: str, did: str) -> str:
     return slugify(f'{cloud_server}_{did}', separator='_')
 
 
+# Awake gateway writes usually return within this window. An idle
+# Yeelight does not: the hub waits out "user ack timeout" first.
+LOCAL_WRITE_GRACE_SEC = 0.4
+
+
 def local_write_needs_cloud(rc: Optional[int]) -> bool:
     """Return True when a local write should be retried in the cloud.
 
@@ -112,6 +117,29 @@ def local_write_needs_cloud(rc: Optional[int]) -> bool:
     -10006 is the gateway request timeout for the same case.
     """
     return rc in (-9999, -10006)
+
+
+def local_write_grace_sec() -> float:
+    """Return how long a local write may block before cloud starts."""
+    return LOCAL_WRITE_GRACE_SEC
+
+
+def should_start_cloud_write(
+    local_finished: bool, rc: Optional[int]
+) -> bool:
+    """Return True when cloud should run alongside or after local.
+
+    A fast local success stays local. If the device is still silent, or
+    it already returned an ack timeout, cloud has to start. Waiting for
+    the whole gateway timeout is what leaves the lamp dark after press.
+    """
+    if not local_finished:
+        return True
+    if rc in (0, 1):
+        return False
+    if rc is None:
+        return True
+    return local_write_needs_cloud(rc)
 
 
 class MIoTMatcher(MQTTMatcher):
