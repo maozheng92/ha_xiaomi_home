@@ -192,6 +192,44 @@ def miio_result_ok(reply: Any) -> bool:
     return reply.get('code') in (0, 1)
 
 
+def absorb_radar_into_main_light(
+    entity_list: dict, prop_list: dict
+) -> bool:
+    """Move ``radar-en`` onto the main light and drop its switch.
+
+    HomeKit receives the main light through Matter. A separate
+    ``radar-en`` switch is a second on/off accessory, so the sensor
+    switch never shows up on that light. Ambient lights are left alone.
+    """
+    main = None
+    for data in entity_list.get('light', []):
+        spec = getattr(data, 'spec', None)
+        if getattr(spec, 'name', None) == 'light':
+            main = data
+            break
+    if main is None or not hasattr(main, 'props'):
+        return False
+    switches = prop_list.get('switch')
+    if not switches:
+        return False
+    radar = None
+    kept = []
+    for prop in switches:
+        if radar is None and getattr(prop, 'name', None) == 'radar-en':
+            radar = prop
+            continue
+        kept.append(prop)
+    if radar is None:
+        return False
+    radar.platform = 'light'
+    main.props.add(radar)
+    if kept:
+        prop_list['switch'] = kept
+    else:
+        prop_list.pop('switch', None)
+    return True
+
+
 def prop_codes_win(codes: Optional[list]) -> bool:
     """Return True when the first property write was accepted.
 

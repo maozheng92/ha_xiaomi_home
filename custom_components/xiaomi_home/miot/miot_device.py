@@ -89,7 +89,8 @@ from .specs.specv2entity import (
     UNIT_PPM,
     UNIT_UG_M3,
 )
-from .common import slugify_name, slugify_did
+from .common import (
+    absorb_radar_into_main_light, slugify_name, slugify_did)
 from .const import DOMAIN
 from .miot_client import MIoTClient
 from .miot_error import MIoTClientError, MIoTDeviceError
@@ -725,6 +726,7 @@ class MIoTDevice:
                 else:
                     action.platform = 'button'
                 self.append_action(action=action)
+        absorb_radar_into_main_light(self._entity_list, self._prop_list)
 
     def unit_convert(self, spec_unit: str) -> Optional[str]:
         """Convert MIoT unit to Home Assistant unit.

@@ -49,6 +49,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -61,6 +63,7 @@ from homeassistant.components.light import (
     LightEntityFeature,
     ColorMode
 )
+from homeassistant.helpers import config_validation as cv
 from homeassistant.util.color import (
     value_to_brightness,
     brightness_to_value
@@ -75,6 +78,8 @@ from .miot.miot_device import MIoTDevice, MIoTEntityData,  MIoTServiceEntity
 from .miot.const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+_RADAR_LIGHTS = 'radar_lights'
 
 
 async def async_setup_entry(
@@ -94,6 +99,39 @@ async def async_setup_entry(
 
     if new_entities:
         async_add_entities(new_entities)
+    _register_radar_service(hass)
+    remembered = hass.data.setdefault(DOMAIN, {}).setdefault(
+        _RADAR_LIGHTS, [])
+    for entity in new_entities:
+        if entity.radar_supported and entity not in remembered:
+            remembered.append(entity)
+
+
+def _register_radar_service(hass: HomeAssistant) -> None:
+    """Register the setter for the radar switch that lives on the light."""
+    if hass.services.has_service(DOMAIN, 'set_radar_en'):
+        return
+
+    async def async_set_radar_en(call) -> None:
+        wanted = set(call.data['entity_id'])
+        enable = call.data['radar_en']
+        lights = hass.data.get(DOMAIN, {}).get(_RADAR_LIGHTS, [])
+        matched = False
+        for light in list(lights):
+            if light.entity_id not in wanted:
+                continue
+            await light.async_set_radar(enable)
+            matched = True
+        if not matched:
+            _LOGGER.error(
+                'set_radar_en missed, %s', call.data['entity_id'])
+
+    hass.services.async_register(
+        DOMAIN, 'set_radar_en', async_set_radar_en,
+        schema=vol.Schema({
+            vol.Required('entity_id'): cv.entity_ids,
+            vol.Required('radar_en'): cv.boolean,
+        }))
 
 
 class Light(MIoTServiceEntity, LightEntity):
@@ -105,6 +143,7 @@ class Light(MIoTServiceEntity, LightEntity):
     _prop_color_temp: Optional[MIoTSpecProperty]
     _prop_color: Optional[MIoTSpecProperty]
     _prop_mode: Optional[MIoTSpecProperty]
+    _prop_radar: Optional[MIoTSpecProperty]
 
     _brightness_scale: Optional[tuple[int, int]]
     _mode_map: Optional[dict[Any, Any]]
@@ -125,11 +164,16 @@ class Light(MIoTServiceEntity, LightEntity):
         self._prop_color_temp = None
         self._prop_color = None
         self._prop_mode = None
+        self._prop_radar = None
         self._brightness_scale = None
         self._mode_map = None
 
         # properties
         for prop in entity_data.props:
+            # Human sensor switch, absorbed from the yeelight service.
+            if prop.name == 'radar-en':
+                self._prop_radar = prop
+                continue
             # on
             if prop.name == 'on':
                 self._prop_on = prop
@@ -208,6 +252,41 @@ class Light(MIoTServiceEntity, LightEntity):
             elif self._prop_on:
                 self._attr_supported_color_modes.add(ColorMode.ONOFF)
                 self._attr_color_mode = ColorMode.ONOFF
+
+    @property
+    def radar_supported(self) -> bool:
+        """Whether this light owns the human-sensor switch."""
+        return self._prop_radar is not None
+
+    @property
+    def extra_state_attributes(self) -> Optional[dict]:
+        """Radar state on the light HomeKit already has."""
+        if self._prop_radar is None:
+            return None
+        return {'radar_en': self._radar_enabled()}
+
+    def _radar_enabled(self) -> Optional[bool]:
+        value = self.get_prop_value(prop=self._prop_radar)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value == 1
+        return None
+
+    async def async_set_radar(self, enable: bool) -> None:
+        """Set the human-sensor switch without turning the bulb on."""
+        if self._prop_radar is None:
+            return
+        value = enable if self._prop_radar.format_ == bool else int(enable)
+        await self.set_property_async(
+            prop=self._prop_radar, value=value, write_ha_state=False)
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        lights = self.hass.data.get(DOMAIN, {}).get(_RADAR_LIGHTS, [])
+        if self in lights:
+            lights.remove(self)
+        await super().async_will_remove_from_hass()
 
     @property
     def is_on(self) -> Optional[bool]:
