@@ -60,8 +60,8 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, get_system_info_str, run_control_routes, same_prop_value,
-    should_push_cloud_shadow, slugify_did)
+    MIoTMatcher, command_still_holds, get_system_info_str, reversal_confirmed,
+    run_control_routes, same_prop_value, should_push_cloud_shadow, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -116,8 +116,9 @@ DEVICE_TIMEOUT_RETRY_DELAY = 1.0
 LOCAL_STATE_POLL_INTERVAL = 8
 # Do not write the cloud shadow again while a failed push is cooling down.
 CLOUD_SHADOW_BACKOFF = 60
-# Ignore a poll that races the command Home Assistant just sent.
-DEVICE_WRITE_QUIET = 3
+# The gateway cache keeps the old off value after the bulb wakes.
+# Polls and cloud writes of that value are ignored until this ends.
+COMMAND_HOLD = 20
 # A sleeping bulb does not answer. Wait before asking it again.
 READ_FAIL_QUIET = 30
 
@@ -1085,6 +1086,24 @@ class MIoTClient:
         if live is None:
             state['quiet_until'] = time.monotonic() + READ_FAIL_QUIET
             return
+        now = time.monotonic()
+        if 'commanded' in state and not same_prop_value(
+                state['commanded'], live):
+            if command_still_holds(
+                    state['commanded'], state.get('commanded_until', 0.0),
+                    live, now):
+                return
+            second = await self.__read_cloud_prop_async(
+                did, siid, piid, datasource=2)
+            if second is not None and same_prop_value(
+                    second, state['commanded']):
+                live = second
+            elif not reversal_confirmed(live, second):
+                return
+        if 'commanded' in state and same_prop_value(
+                state['commanded'], live):
+            state.pop('commanded', None)
+            state['commanded_until'] = 0.0
         if (
             'published' not in state
             or not same_prop_value(state['published'], live)
@@ -1103,6 +1122,10 @@ class MIoTClient:
             return
         confirmed = await self.__read_device_prop_async(did, siid, piid)
         if confirmed is None or not same_prop_value(live, confirmed):
+            return
+        if 'commanded' in state and command_still_holds(
+                state['commanded'], state.get('commanded_until', 0.0),
+                confirmed, time.monotonic()):
             return
         if await self.__write_cloud_shadow_async(
                 did, siid, piid, confirmed):
@@ -1223,8 +1246,28 @@ class MIoTClient:
         state = self._device_watch.get((did, siid, piid))
         if state is None:
             return
+        now = time.monotonic()
         state['published'] = value
-        state['quiet_until'] = time.monotonic() + DEVICE_WRITE_QUIET
+        state['commanded'] = value
+        state['commanded_until'] = now + COMMAND_HOLD
+        state['quiet_until'] = now + COMMAND_HOLD
+
+    def __drop_stale_command_value(self, params: dict) -> bool:
+        """Ignore an old off report while a recent on command is settling."""
+        if not isinstance(params, dict):
+            return False
+        state = self._device_watch.get(
+            (params.get('did'), params.get('siid'), params.get('piid')))
+        if not state or 'commanded' not in state:
+            return False
+        value = params.get('value', None)
+        if same_prop_value(state['commanded'], value):
+            state.pop('commanded', None)
+            state['commanded_until'] = 0.0
+            return False
+        return command_still_holds(
+            state['commanded'], state.get('commanded_until', 0.0),
+            value, time.monotonic())
 
     def __raise_control_error(
         self, did: str, rc: Optional[int]
@@ -1672,6 +1715,8 @@ class MIoTClient:
     def __on_prop_msg(self, params: dict, ctx: Any) -> None:
         """params MUST contain did, siid, piid, value"""
         # BLE device has no online/offline msg
+        if self.__drop_stale_command_value(params):
+            return
         try:
             subs: list[MIoTClientSub] = list(self._sub_tree.iter_match(
                 f'{params["did"]}/p/{params["siid"]}/{params["piid"]}'))
