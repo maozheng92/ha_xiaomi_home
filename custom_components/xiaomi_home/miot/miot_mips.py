@@ -67,7 +67,9 @@ from paho.mqtt.client import (
     MQTTMessage)
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher, iter_cloud_uplink
+from .common import (
+    MIoTMatcher, gateway_get_properties_rpc, gateway_rpc_prop_value,
+    iter_cloud_uplink)
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -1311,6 +1313,19 @@ class MipsLocalClient(_MipsClient):
         if not isinstance(result_obj, dict) or 'value' not in result_obj:
             return None
         return result_obj['value']
+
+    @final
+    async def get_device_prop_async(
+        self, did: str, siid: int, piid: int, timeout_ms: int = 10000
+    ) -> Any:
+        """Read the device. ``get_prop_async`` reads the gateway cache."""
+        payload_obj = gateway_get_properties_rpc(
+            did, siid, piid, self.__gen_mips_id)
+        result_obj = await self.__request_async(
+            topic='proxy/rpcReq',
+            payload=json.dumps(payload_obj),
+            timeout_ms=timeout_ms)
+        return gateway_rpc_prop_value(did, result_obj)
 
     @final
     async def set_prop_async(

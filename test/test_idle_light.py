@@ -153,6 +153,36 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 
 
 @pytest.mark.github
+def test_gateway_get_properties_reads_the_device():
+    """proxy/get is the cache. get_properties is one device read."""
+    from miot.common import (
+        gateway_get_properties_rpc, gateway_rpc_prop_value)
+
+    payload = gateway_get_properties_rpc('2032272962', 2, 1, 99)
+    assert payload == {
+        'did': '2032272962',
+        'rpc': {
+            'id': 99,
+            'method': 'get_properties',
+            'params': [{
+                'did': '2032272962', 'siid': 2, 'piid': 1}],
+        },
+    }
+    result = {
+        'result': [{
+            'did': '2032272962', 'siid': 2, 'piid': 1,
+            'code': 0, 'value': False,
+        }]
+    }
+    assert gateway_rpc_prop_value('2032272962', result) is False
+    assert gateway_rpc_prop_value('2032272962', {
+        'result': [{
+            'did': '2032272962', 'code': -9999, 'value': True}]
+    }) is None
+    assert gateway_rpc_prop_value('other', result) is None
+
+
+@pytest.mark.github
 def test_recent_on_command_blocks_a_stale_off_read():
     """A gateway cache of off must not undo the on command just sent."""
     from miot.common import command_still_holds

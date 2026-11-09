@@ -316,6 +316,43 @@ def same_prop_value(left: Any, right: Any) -> bool:
     return False
 
 
+def gateway_get_properties_rpc(
+    did: str, siid: int, piid: int, rpc_id: int
+) -> dict:
+    """Build the RPC that makes the gateway read the device.
+
+    ``proxy/get`` returns the gateway cache. ``get_properties`` is sent
+    to the device, so the gateway can replace that cached value.
+    """
+    return {
+        'did': did,
+        'rpc': {
+            'id': rpc_id,
+            'method': 'get_properties',
+            'params': [{
+                'did': did,
+                'siid': siid,
+                'piid': piid,
+            }],
+        },
+    }
+
+
+def gateway_rpc_prop_value(did: str, result: Any) -> Any:
+    """Return the value from one gateway ``get_properties`` result."""
+    if not isinstance(result, dict):
+        return None
+    rows = result.get('result')
+    if not isinstance(rows, list) or len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or row.get('did') != did:
+        return None
+    if row.get('code', 0) not in (0, 1) or 'value' not in row:
+        return None
+    return row.get('value')
+
+
 def command_still_holds(
     commanded: Any, until: float, value: Any, now: float
 ) -> bool:

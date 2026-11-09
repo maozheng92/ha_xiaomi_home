@@ -121,6 +121,10 @@ CLOUD_SHADOW_BACKOFF = 60
 COMMAND_HOLD = 20
 # A sleeping bulb does not answer. Wait before asking it again.
 READ_FAIL_QUIET = 30
+# The cloud write returns before the lamp has reported the new value.
+# One gateway device read follows, after the rest of the turn-on.
+GATEWAY_DEVICE_READ_DELAY = 2.0
+GATEWAY_DEVICE_READ_TIMEOUT_MS = 6000
 
 @dataclass
 class MIoTClientSub:
@@ -767,6 +771,10 @@ class MIoTClient:
                     self.__mirror_watched_prop(did, siid, piid, value))
             else:
                 self.__note_device_write(did, siid, piid, value)
+                if self.__gateway_client(did) is not None:
+                    self._main_loop.create_task(
+                        self.__read_gateway_device_once_async(
+                            did, siid, piid))
             return True
         self.__raise_control_error(did, rc)
 
@@ -1137,17 +1145,21 @@ class MIoTClient:
                 return lan
         return await self.__read_cloud_prop_async(did, siid, piid, datasource=2)
 
-    async def __read_gateway_prop_async(
-        self, did: str, siid: int, piid: int
-    ) -> Any:
+    def __gateway_client(self, did: str) -> Optional[MipsLocalClient]:
         device_gw = self._device_list_gateway.get(did, None)
         if not (
-            device_gw and device_gw.get('online', False)
+            device_gw
+            and device_gw.get('online', False)
             and device_gw.get('specv2_access', False)
             and 'group_id' in device_gw
         ):
             return None
-        mips = self._mips_local.get(device_gw['group_id'], None)
+        return self._mips_local.get(device_gw['group_id'], None)
+
+    async def __read_gateway_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        mips = self.__gateway_client(did)
         if mips is None:
             return None
         try:
@@ -1156,6 +1168,31 @@ class MIoTClient:
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.debug('gateway prop read failed, %s, %s', did, err)
             return None
+
+    async def __read_gateway_device_once_async(
+        self, did: str, siid: int, piid: int
+    ) -> None:
+        """Ask the gateway to read the device once after a cloud write.
+
+        ``proxy/get`` keeps the previous value. ``get_properties`` goes
+        to the bulb. The result is only logged. It is not written back
+        to the cloud.
+        """
+        try:
+            await asyncio.sleep(GATEWAY_DEVICE_READ_DELAY)
+            mips = self.__gateway_client(did)
+            if mips is None:
+                return
+            live = await mips.get_device_prop_async(
+                did=did, siid=siid, piid=piid,
+                timeout_ms=GATEWAY_DEVICE_READ_TIMEOUT_MS)
+            _LOGGER.info(
+                'gateway device read after cloud set, %s.%d.%d, %s',
+                did, siid, piid, live)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info(
+                'gateway device read after cloud set failed, %s, %s',
+                did, err)
 
     async def __read_lan_prop_async(
         self, did: str, siid: int, piid: int
