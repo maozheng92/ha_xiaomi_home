@@ -353,6 +353,44 @@ def gateway_rpc_prop_value(did: str, result: Any) -> Any:
     return row.get('value')
 
 
+def prop_time_seconds(stamp: Any) -> Optional[float]:
+    """Convert a Xiaomi second or millisecond timestamp to Unix seconds."""
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    if stamp <= 0:
+        return None
+    if stamp >= 10_000_000_000:
+        stamp = float(stamp) / 1000.0
+    return float(stamp)
+
+
+def cloud_mirror_wanted(source: Optional[str], in_cloud: bool) -> bool:
+    """Keep a cloud subscription beside a gateway or LAN subscription.
+
+    A sleeping Wi-Fi light stays offline in the cloud device list. Mi
+    Home still publishes its property changes there. The online flag
+    does not decide this subscription.
+    """
+    return in_cloud and source not in (None, 'cloud')
+
+
+def newer_cloud_cache(
+    local: Any, local_ts: Optional[float],
+    cloud: Any, cloud_ts: Optional[float],
+) -> bool:
+    """The cloud cache changed after the gateway or LAN cache.
+
+    Mi Home turns a sleeping light on in the cloud. ``proxy/get`` keeps
+    the old off value and its old timestamp. Home Assistant follows the
+    newer cloud value instead of writing that off back.
+    """
+    if cloud is None or cloud_ts is None or local_ts is None:
+        return False
+    if same_prop_value(local, cloud):
+        return False
+    return cloud_ts > local_ts
+
+
 def command_still_holds(
     commanded: Any, until: float, value: Any, now: float
 ) -> bool:

@@ -60,8 +60,10 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, command_still_holds, get_system_info_str, run_control_routes,
-    same_prop_value, should_push_cloud_shadow, slugify_did)
+    MIoTMatcher, cloud_mirror_wanted, command_still_holds,
+    get_system_info_str, newer_cloud_cache, prop_time_seconds,
+    run_control_routes, same_prop_value, should_push_cloud_shadow,
+    slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -1090,17 +1092,48 @@ class MIoTClient:
     async def __sync_device_prop_async(
         self, did: str, siid: int, piid: int, state: dict
     ) -> None:
-        live = await self.__read_device_prop_async(did, siid, piid)
+        local = await self.__read_local_prop_record_async(did, siid, piid)
+        cache = await self.__read_cloud_cache_record_async(did, siid, piid)
+        from_cloud_cache = False
+        if local is None:
+            live = await self.__read_cloud_prop_async(
+                did, siid, piid, datasource=2)
+        else:
+            live = local['value']
+            cloud_value = None if cache is None else cache.get('value')
+            if newer_cloud_cache(
+                    live, local.get('ts'),
+                    cloud_value,
+                    None if cache is None else cache.get('ts')):
+                # Mi Home changed the cloud cache after the gateway
+                # stored its value. Follow that cache.
+                _LOGGER.info(
+                    'cloud cache is newer, %s.%d.%d, %s at %s, '
+                    'cloud %s at %s',
+                    did, siid, piid, live, local.get('ts'),
+                    cloud_value, cache.get('ts') if cache else None)
+                live = cloud_value
+                from_cloud_cache = True
         if live is None:
             state['quiet_until'] = time.monotonic() + READ_FAIL_QUIET
             return
-        if 'commanded' in state and not same_prop_value(
+        if from_cloud_cache:
+            # A newer cloud value that contradicts the last command is a
+            # Mi Home change. A matching value keeps the guard, so a
+            # later stale gateway read is still ignored.
+            if (
+                'commanded' in state
+                and not same_prop_value(state['commanded'], live)
+            ):
+                state.pop('commanded', None)
+                state['commanded_until'] = 0.0
+        elif 'commanded' in state and not same_prop_value(
                 state['commanded'], live):
             # proxy/get keeps the previous off value after a cloud on.
             # The cloud echo of on does not refresh that cache. Writing
             # the cached off back to the cloud turns the bulb off.
             return
-        if 'commanded' in state and same_prop_value(
+        elif 'commanded' in state and same_prop_value(
                 state['commanded'], live):
             state.pop('commanded', None)
             state['commanded_until'] = 0.0
@@ -1114,7 +1147,9 @@ class MIoTClient:
                     'did': did, 'siid': siid, 'piid': piid, 'value': live,
                 },
                 ctx=None)
-        shadow = await self.__read_cloud_cache_async(did, siid, piid)
+        if from_cloud_cache:
+            return
+        shadow = None if cache is None else cache.get('value')
         if not should_push_cloud_shadow(
             live, shadow, state.get('fail_at', 0.0),
             time.monotonic(), CLOUD_SHADOW_BACKOFF
@@ -1159,15 +1194,37 @@ class MIoTClient:
     async def __read_gateway_prop_async(
         self, did: str, siid: int, piid: int
     ) -> Any:
+        record = await self.__read_gateway_record_async(did, siid, piid)
+        if record is None:
+            return None
+        return record.get('value')
+
+    async def __read_gateway_record_async(
+        self, did: str, siid: int, piid: int
+    ) -> Optional[dict]:
         mips = self.__gateway_client(did)
         if mips is None:
             return None
         try:
-            return await mips.get_prop_async(
+            return await mips.get_cached_prop_async(
                 did=did, siid=siid, piid=piid, timeout_ms=4000)
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.debug('gateway prop read failed, %s, %s', did, err)
             return None
+
+    async def __read_local_prop_record_async(
+        self, did: str, siid: int, piid: int
+    ) -> Optional[dict]:
+        """Read the gateway cache, then LAN. Cloud cache is separate."""
+        if self._ctrl_mode != CtrlMode.AUTO:
+            return None
+        gateway = await self.__read_gateway_record_async(did, siid, piid)
+        if gateway is not None:
+            return gateway
+        lan = await self.__read_lan_prop_async(did, siid, piid)
+        if lan is None:
+            return None
+        return {'value': lan, 'ts': None}
 
     async def __read_gateway_device_once_async(
         self, did: str, siid: int, piid: int
@@ -1207,15 +1264,30 @@ class MIoTClient:
             _LOGGER.debug('lan prop read failed, %s, %s', did, err)
             return None
 
-    async def __read_cloud_cache_async(
+    async def __read_cloud_cache_record_async(
         self, did: str, siid: int, piid: int
-    ) -> Any:
-        return await self.__read_cloud_prop_async(
+    ) -> Optional[dict]:
+        row = await self.__read_cloud_prop_row_async(
             did, siid, piid, datasource=1)
+        if row is None:
+            return None
+        return {
+            'value': row['value'],
+            'ts': prop_time_seconds(row.get('updateTime')),
+        }
 
     async def __read_cloud_prop_async(
         self, did: str, siid: int, piid: int, datasource: int
     ) -> Any:
+        row = await self.__read_cloud_prop_row_async(
+            did, siid, piid, datasource)
+        if row is None:
+            return None
+        return row.get('value')
+
+    async def __read_cloud_prop_row_async(
+        self, did: str, siid: int, piid: int, datasource: int
+    ) -> Optional[dict]:
         if not self._network.network_status:
             return None
         try:
@@ -1233,7 +1305,7 @@ class MIoTClient:
             or 'value' not in results[0]
         ):
             return None
-        return results[0]['value']
+        return results[0]
 
     async def __write_cloud_shadow_async(
         self, did: str, siid: int, piid: int, value: Any
@@ -1431,12 +1503,13 @@ class MIoTClient:
         """Keep cloud pushes when the primary source is local.
 
         A Wi-Fi light reached through the central gateway reports
-        changes to the cloud. After the radio sleeps, the gateway stops
-        forwarding those pushes while Mi Home still receives them, so
-        Home Assistant drifts. The mirror subscription closes that gap.
+        changes to the cloud. After the radio sleeps, the cloud device
+        list marks it offline and the gateway stops forwarding pushes.
+        Mi Home still receives them. The mirror subscription stays up
+        while the device remains in the cloud list.
         """
-        cloud = self._device_list_cloud.get(did) or {}
-        want = source not in (None, 'cloud') and cloud.get('online', False)
+        want = cloud_mirror_wanted(
+            source, did in self._device_list_cloud)
         has = did in self._cloud_mirror_subs
         if want and not has and self._mips_cloud is not None:
             self._mips_cloud.sub_prop(did=did, handler=self.__on_prop_msg)

@@ -153,6 +153,28 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 
 
 @pytest.mark.github
+def test_mihome_on_is_newer_than_the_gateway_cache():
+    """Mi Home moves the cloud timestamp. The gateway cache stays old."""
+    from miot.common import (
+        cloud_mirror_wanted, newer_cloud_cache, prop_time_seconds)
+
+    gateway_ts = prop_time_seconds(1794222062895)
+    cloud_ts = prop_time_seconds(1794222618)
+    assert gateway_ts == 1794222062.895
+    assert cloud_ts == 1794222618
+    assert newer_cloud_cache(False, gateway_ts, True, cloud_ts)
+    assert not newer_cloud_cache(True, cloud_ts, False, gateway_ts)
+    assert not newer_cloud_cache(False, gateway_ts, False, cloud_ts)
+    assert not newer_cloud_cache(False, None, True, cloud_ts)
+    # A sleeping light is offline in the cloud list and still needs
+    # the cloud subscription while the gateway is the primary source.
+    assert cloud_mirror_wanted('group-1', True)
+    assert not cloud_mirror_wanted('cloud', True)
+    assert not cloud_mirror_wanted('group-1', False)
+    assert not cloud_mirror_wanted(None, True)
+
+
+@pytest.mark.github
 def test_gateway_get_properties_reads_the_device():
     """proxy/get is the cache. get_properties is one device read."""
     from miot.common import (
