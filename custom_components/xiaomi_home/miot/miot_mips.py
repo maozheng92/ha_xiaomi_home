@@ -68,8 +68,8 @@ from paho.mqtt.client import (
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, gateway_get_properties_rpc, gateway_rpc_prop_value,
-    iter_cloud_uplink, prop_time_seconds)
+    MIoTMatcher, cloud_property_topics, gateway_get_properties_rpc,
+    gateway_rpc_prop_value, iter_cloud_uplink, prop_time_seconds)
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -894,9 +894,7 @@ class MipsCloudClient(_MipsClient):
         if not isinstance(did, str) or handler is None:
             raise MIoTMipsError('invalid params')
 
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
+        topics = cloud_property_topics(did, siid, piid)
 
         def on_prop_msg(topic: str, payload: str, ctx: Any) -> None:
             try:
@@ -915,8 +913,12 @@ class MipsCloudClient(_MipsClient):
                 self.log_debug('on properties_changed, %s', payload)
                 for params in changes:
                     handler(params, ctx)
-        return self.__reg_broadcast_external(
-            topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx)
+        subscribed = False
+        for topic in topics:
+            subscribed = self.__reg_broadcast_external(
+                topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx
+            ) or subscribed
+        return subscribed
 
     @final
     def unsub_prop(
@@ -927,10 +929,10 @@ class MipsCloudClient(_MipsClient):
     ) -> bool:
         if not isinstance(did, str):
             raise MIoTMipsError('invalid params')
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
-        return self.__unreg_broadcast_external(topic=topic)
+        removed = False
+        for topic in cloud_property_topics(did, siid, piid):
+            removed = self.__unreg_broadcast_external(topic=topic) or removed
+        return removed
 
     @final
     def sub_event(

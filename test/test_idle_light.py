@@ -153,19 +153,33 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 
 
 @pytest.mark.github
-def test_mihome_on_is_newer_than_the_gateway_cache():
-    """Mi Home moves the cloud timestamp. The gateway cache stays old."""
+def test_mihome_local_on_comes_from_the_bulb_or_v3_report():
+    """A local-list command does not update the cloud shadow."""
     from miot.common import (
-        cloud_mirror_wanted, newer_cloud_cache, prop_time_seconds)
+        cloud_mirror_wanted, cloud_property_topics, iter_cloud_uplink,
+        prop_time_seconds, watched_prop_value)
 
     gateway_ts = prop_time_seconds(1794222062895)
     cloud_ts = prop_time_seconds(1794222618)
-    assert gateway_ts == 1794222062.895
-    assert cloud_ts == 1794222618
-    assert newer_cloud_cache(False, gateway_ts, True, cloud_ts)
-    assert not newer_cloud_cache(True, cloud_ts, False, gateway_ts)
-    assert not newer_cloud_cache(False, gateway_ts, False, cloud_ts)
-    assert not newer_cloud_cache(False, None, True, cloud_ts)
+    # No report: both caches stay off. The bulb read is the new on.
+    assert watched_prop_value(
+        True, False, gateway_ts, False, gateway_ts) == (True, 'device')
+    # The report reached the cloud cache after the gateway stored off.
+    assert watched_prop_value(
+        False, False, gateway_ts, True, cloud_ts) == (True, 'cloud')
+    # No bulb read yet, and the cloud cache is still the old off.
+    assert watched_prop_value(
+        None, False, gateway_ts, False, gateway_ts) == (False, 'gateway')
+    assert cloud_property_topics('2032272962') == (
+        'device/2032272962/up/properties_changed/#',
+        'device/2032272962/up/properties_changed_v3/#',
+    )
+    topic = 'device/2032272962/up/properties_changed_v3/0/2/1'
+    assert iter_cloud_uplink(
+        topic, {'params': {'value': True}}, ('siid', 'piid', 'value')
+    ) == [{
+        'did': '2032272962', 'miid': 0, 'siid': 2, 'piid': 1, 'value': True,
+    }]
     # A sleeping light is offline in the cloud list and still needs
     # the cloud subscription while the gateway is the primary source.
     assert cloud_mirror_wanted('group-1', True)

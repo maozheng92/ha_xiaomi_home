@@ -61,9 +61,9 @@ from homeassistant.components import zeroconf
 # pylint: disable=relative-beyond-top-level
 from .common import (
     MIoTMatcher, cloud_mirror_wanted, command_still_holds,
-    get_system_info_str, newer_cloud_cache, prop_time_seconds,
-    run_control_routes, same_prop_value, should_push_cloud_shadow,
-    slugify_did)
+    get_system_info_str, prop_time_seconds, run_control_routes,
+    same_prop_value, should_push_cloud_shadow, slugify_did,
+    watched_prop_value)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -1092,41 +1092,71 @@ class MIoTClient:
     async def __sync_device_prop_async(
         self, did: str, siid: int, piid: int, state: dict
     ) -> None:
-        local = await self.__read_local_prop_record_async(did, siid, piid)
+        now = time.monotonic()
+        device = None
+        if (
+            self._ctrl_mode == CtrlMode.AUTO
+            and state.get('device_quiet_until', 0) <= now
+        ):
+            device = await self.__read_gateway_device_value_async(
+                did, siid, piid)
+            if device is None and self.__gateway_client(did) is not None:
+                # A sleeping bulb does not answer. Don't ask on every poll.
+                state['device_quiet_until'] = now + READ_FAIL_QUIET
+        gateway = None
+        if self._ctrl_mode == CtrlMode.AUTO:
+            gateway = await self.__read_gateway_record_async(
+                did, siid, piid)
         cache = await self.__read_cloud_cache_record_async(did, siid, piid)
-        from_cloud_cache = False
-        if local is None:
-            live = await self.__read_cloud_prop_async(
-                did, siid, piid, datasource=2)
-        else:
-            live = local['value']
-            cloud_value = None if cache is None else cache.get('value')
-            if newer_cloud_cache(
-                    live, local.get('ts'),
-                    cloud_value,
-                    None if cache is None else cache.get('ts')):
-                # Mi Home changed the cloud cache after the gateway
-                # stored its value. Follow that cache.
-                _LOGGER.info(
-                    'cloud cache is newer, %s.%d.%d, %s at %s, '
-                    'cloud %s at %s',
-                    did, siid, piid, live, local.get('ts'),
-                    cloud_value, cache.get('ts') if cache else None)
-                live = cloud_value
-                from_cloud_cache = True
+        cloud_value = None if cache is None else cache.get('value')
+        live, source = watched_prop_value(
+            device,
+            None if gateway is None else gateway.get('value'),
+            None if gateway is None else gateway.get('ts'),
+            cloud_value,
+            None if cache is None else cache.get('ts'))
+        from_cloud_cache = source == 'cloud'
+        if source == 'cloud':
+            _LOGGER.info(
+                'cloud cache is newer, %s.%d.%d, gateway %s at %s, '
+                'cloud %s at %s',
+                did, siid, piid,
+                None if gateway is None else gateway.get('value'),
+                None if gateway is None else gateway.get('ts'),
+                cloud_value, cache.get('ts') if cache else None)
+        elif live is None:
+            lan = await self.__read_lan_prop_async(did, siid, piid)
+            if lan is not None:
+                live = lan
+            else:
+                live = await self.__read_cloud_prop_async(
+                    did, siid, piid, datasource=2)
         if live is None:
             state['quiet_until'] = time.monotonic() + READ_FAIL_QUIET
             return
         if from_cloud_cache:
-            # A newer cloud value that contradicts the last command is a
-            # Mi Home change. A matching value keeps the guard, so a
-            # later stale gateway read is still ignored.
+            # A newer cloud value is a report, or a prop/set from a light
+            # that is not in the gateway local list. A matching command
+            # keeps the guard so a later stale gateway read is ignored.
             if (
                 'commanded' in state
                 and not same_prop_value(state['commanded'], live)
             ):
                 state.pop('commanded', None)
                 state['commanded_until'] = 0.0
+        elif (
+            source == 'device'
+            and 'commanded' in state
+            and not same_prop_value(state['commanded'], live)
+        ):
+            # The bulb itself disagrees with the command. Ignore that
+            # while the command is still settling, then follow the bulb.
+            if command_still_holds(
+                    state['commanded'], state.get('commanded_until', 0.0),
+                    live, time.monotonic()):
+                return
+            state.pop('commanded', None)
+            state['commanded_until'] = 0.0
         elif 'commanded' in state and not same_prop_value(
                 state['commanded'], live):
             # proxy/get keeps the previous off value after a cloud on.
@@ -1141,6 +1171,10 @@ class MIoTClient:
             'published' not in state
             or not same_prop_value(state['published'], live)
         ):
+            if source == 'device':
+                _LOGGER.info(
+                    'gateway device read, %s.%d.%d, %s',
+                    did, siid, piid, live)
             state['published'] = live
             self.__on_prop_msg(
                 params={
@@ -1212,19 +1246,20 @@ class MIoTClient:
             _LOGGER.debug('gateway prop read failed, %s, %s', did, err)
             return None
 
-    async def __read_local_prop_record_async(
+    async def __read_gateway_device_value_async(
         self, did: str, siid: int, piid: int
-    ) -> Optional[dict]:
-        """Read the gateway cache, then LAN. Cloud cache is separate."""
-        if self._ctrl_mode != CtrlMode.AUTO:
+    ) -> Any:
+        """Ask the bulb. ``proxy/get`` is only the gateway cache."""
+        mips = self.__gateway_client(did)
+        if mips is None:
             return None
-        gateway = await self.__read_gateway_record_async(did, siid, piid)
-        if gateway is not None:
-            return gateway
-        lan = await self.__read_lan_prop_async(did, siid, piid)
-        if lan is None:
+        try:
+            return await mips.get_device_prop_async(
+                did=did, siid=siid, piid=piid,
+                timeout_ms=GATEWAY_DEVICE_READ_TIMEOUT_MS)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug('gateway device read failed, %s, %s', did, err)
             return None
-        return {'value': lan, 'ts': None}
 
     async def __read_gateway_device_once_async(
         self, did: str, siid: int, piid: int
@@ -1502,11 +1537,11 @@ class MIoTClient:
     ) -> None:
         """Keep cloud pushes when the primary source is local.
 
-        A Wi-Fi light reached through the central gateway reports
-        changes to the cloud. After the radio sleeps, the cloud device
-        list marks it offline and the gateway stops forwarding pushes.
-        Mi Home still receives them. The mirror subscription stays up
-        while the device remains in the cloud list.
+        The bulb reports ``properties_changed`` and
+        ``properties_changed_v3`` on the cloud broker. After the radio
+        sleeps, the cloud device list marks it offline and the gateway
+        stops forwarding those reports. The mirror stays up while the
+        device remains in the cloud list.
         """
         want = cloud_mirror_wanted(
             source, did in self._device_list_cloud)

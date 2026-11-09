@@ -367,9 +367,9 @@ def prop_time_seconds(stamp: Any) -> Optional[float]:
 def cloud_mirror_wanted(source: Optional[str], in_cloud: bool) -> bool:
     """Keep a cloud subscription beside a gateway or LAN subscription.
 
-    A sleeping Wi-Fi light stays offline in the cloud device list. Mi
-    Home still publishes its property changes there. The online flag
-    does not decide this subscription.
+    The bulb reports on the cloud broker. A sleeping Wi-Fi light stays
+    offline in the cloud device list, and the gateway may not forward
+    that report. The online flag does not decide this subscription.
     """
     return in_cloud and source not in (None, 'cloud')
 
@@ -380,15 +380,36 @@ def newer_cloud_cache(
 ) -> bool:
     """The cloud cache changed after the gateway or LAN cache.
 
-    Mi Home turns a sleeping light on in the cloud. ``proxy/get`` keeps
-    the old off value and its old timestamp. Home Assistant follows the
-    newer cloud value instead of writing that off back.
+    A property report, or a cloud prop/set for a light that is not in
+    the gateway local list, moves updateTime. Mi Home does not write
+    the cloud when the light is in that list. Follow the newer cache
+    instead of writing the older off back.
     """
     if cloud is None or cloud_ts is None or local_ts is None:
         return False
     if same_prop_value(local, cloud):
         return False
     return cloud_ts > local_ts
+
+
+def watched_prop_value(
+    device: Any, gateway: Any, gateway_ts: Optional[float],
+    cloud: Any, cloud_ts: Optional[float],
+) -> tuple[Any, str]:
+    """Choose the watched value for a light on the gateway local list.
+
+    Mi Home writes that list only through the gateway and refreshes its
+    own screen from the command. The cloud shadow stays unchanged until
+    ``properties_changed`` or ``properties_changed_v3``. A newer cloud
+    cache is that report. Otherwise the bulb read wins over ``proxy/get``.
+    """
+    if newer_cloud_cache(gateway, gateway_ts, cloud, cloud_ts):
+        return cloud, 'cloud'
+    if device is not None:
+        return device, 'device'
+    if gateway is not None:
+        return gateway, 'gateway'
+    return None, ''
 
 
 def command_still_holds(
@@ -430,6 +451,44 @@ def did_from_device_topic(topic: str) -> Optional[str]:
     return None
 
 
+def cloud_property_topics(
+    did: str, siid: Optional[int] = None, piid: Optional[int] = None
+) -> tuple[str, str]:
+    """Cloud topics that carry one device's property reports.
+
+    Mi Home subscribes to both. ``properties_changed_v3`` inserts miid
+    and is not covered by a ``properties_changed`` subscription.
+    """
+    if siid is None or piid is None:
+        current = f'device/{did}/up/properties_changed/#'
+    else:
+        current = f'device/{did}/up/properties_changed/{siid}/{piid}'
+    return current, f'device/{did}/up/properties_changed_v3/#'
+
+
+def uplink_spec_ids(topic: str) -> dict:
+    """Read siid and piid from a property-report topic.
+
+    ``properties_changed/{siid}/{piid}``
+    ``properties_changed_v3/{miid}/{siid}/{piid}``
+    """
+    parts = str(topic).split('/')
+    if len(parts) < 6 or parts[0] != 'device' or parts[2] != 'up':
+        return {}
+    try:
+        if parts[3] == 'properties_changed':
+            return {'siid': int(parts[4]), 'piid': int(parts[5])}
+        if parts[3] == 'properties_changed_v3' and len(parts) >= 7:
+            return {
+                'miid': int(parts[4]),
+                'siid': int(parts[5]),
+                'piid': int(parts[6]),
+            }
+    except ValueError:
+        return {}
+    return {}
+
+
 def with_did(params: dict, did: Optional[str]) -> dict:
     """Copy a property or event payload and fill a missing did."""
     if did and isinstance(params, dict) and 'did' not in params:
@@ -457,9 +516,15 @@ def iter_cloud_uplink(
     else:
         return []
     did = did_from_device_topic(topic)
+    ids = uplink_spec_ids(topic)
     changes = []
     for item in items:
-        if any(key not in item for key in required):
+        merged = with_did(item, did)
+        extra = {
+            key: value for key, value in ids.items() if key not in merged}
+        if extra:
+            merged = {**merged, **extra}
+        if any(key not in merged for key in required):
             continue
-        changes.append(with_did(item, did))
+        changes.append(merged)
     return changes
