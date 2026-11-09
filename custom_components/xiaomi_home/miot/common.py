@@ -330,17 +330,6 @@ def command_still_holds(
     return not same_prop_value(commanded, value)
 
 
-def reversal_confirmed(live: Any, second: Any) -> bool:
-    """A contradictory read may be written back when another source agrees.
-
-    ``second`` is None when that source did not answer. Agreement of the
-    two reads is required before an on command is replaced with off.
-    """
-    if live is None or second is None:
-        return False
-    return same_prop_value(live, second)
-
-
 def should_push_cloud_shadow(
     live: Any, shadow: Any, fail_at: float, now: float, backoff: float
 ) -> bool:

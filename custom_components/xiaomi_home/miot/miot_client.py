@@ -60,8 +60,8 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, command_still_holds, get_system_info_str, reversal_confirmed,
-    run_control_routes, same_prop_value, should_push_cloud_shadow, slugify_did)
+    MIoTMatcher, command_still_holds, get_system_info_str, run_control_routes,
+    same_prop_value, should_push_cloud_shadow, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -1086,20 +1086,12 @@ class MIoTClient:
         if live is None:
             state['quiet_until'] = time.monotonic() + READ_FAIL_QUIET
             return
-        now = time.monotonic()
         if 'commanded' in state and not same_prop_value(
                 state['commanded'], live):
-            if command_still_holds(
-                    state['commanded'], state.get('commanded_until', 0.0),
-                    live, now):
-                return
-            second = await self.__read_cloud_prop_async(
-                did, siid, piid, datasource=2)
-            if second is not None and same_prop_value(
-                    second, state['commanded']):
-                live = second
-            elif not reversal_confirmed(live, second):
-                return
+            # proxy/get keeps the previous off value after a cloud on.
+            # The cloud echo of on does not refresh that cache. Writing
+            # the cached off back to the cloud turns the bulb off.
+            return
         if 'commanded' in state and same_prop_value(
                 state['commanded'], live):
             state.pop('commanded', None)
@@ -1123,9 +1115,8 @@ class MIoTClient:
         confirmed = await self.__read_device_prop_async(did, siid, piid)
         if confirmed is None or not same_prop_value(live, confirmed):
             return
-        if 'commanded' in state and command_still_holds(
-                state['commanded'], state.get('commanded_until', 0.0),
-                confirmed, time.monotonic()):
+        if 'commanded' in state and not same_prop_value(
+                state['commanded'], confirmed):
             return
         if await self.__write_cloud_shadow_async(
                 did, siid, piid, confirmed):
@@ -1262,12 +1253,15 @@ class MIoTClient:
             return False
         value = params.get('value', None)
         if same_prop_value(state['commanded'], value):
-            state.pop('commanded', None)
-            state['commanded_until'] = 0.0
+            # A cloud echo of the command is not a gateway-cache refresh.
             return False
-        return command_still_holds(
-            state['commanded'], state.get('commanded_until', 0.0),
-            value, time.monotonic())
+        if command_still_holds(
+                state['commanded'], state.get('commanded_until', 0.0),
+                value, time.monotonic()):
+            return True
+        state.pop('commanded', None)
+        state['commanded_until'] = 0.0
+        return False
 
     def __raise_control_error(
         self, did: str, rc: Optional[int]

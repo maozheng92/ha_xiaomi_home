@@ -155,16 +155,13 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 @pytest.mark.github
 def test_recent_on_command_blocks_a_stale_off_read():
     """A gateway cache of off must not undo the on command just sent."""
-    from miot.common import command_still_holds, reversal_confirmed
+    from miot.common import command_still_holds
 
     assert command_still_holds(True, 100, False, 90)
     assert command_still_holds(True, 100, 0, 90)
     assert not command_still_holds(True, 100, True, 90)
     assert not command_still_holds(True, 100, 1, 90)
     assert not command_still_holds(True, 100, False, 100)
-    assert reversal_confirmed(False, 0)
-    assert not reversal_confirmed(False, None)
-    assert not reversal_confirmed(False, True)
 
 
 @pytest.mark.github
