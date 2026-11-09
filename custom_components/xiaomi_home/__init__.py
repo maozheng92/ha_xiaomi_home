@@ -54,7 +54,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.components import persistent_notification
 from homeassistant.helpers import config_validation as cv, device_registry, entity_registry
 
-from .miot.common import slugify_did
+from .miot.common import lookup_device_entry, slugify_did
 from .miot.miot_storage import (
     DeviceManufacturer, MIoTStorage, MIoTCert)
 from .miot.miot_spec import (
@@ -343,13 +343,14 @@ async def async_setup_entry(
         if isinstance(devices_remove, list) and devices_remove:
             dr = device_registry.async_get(hass)
             for did in devices_remove:
-                device_entry = dr.async_get_device(
-                    identifiers={(
+                device_entry = lookup_device_entry(
+                    dr,
+                    (
                         DOMAIN,
                         slugify_did(
                             cloud_server=config_entry.data['cloud_server'],
-                            did=did))},
-                    connections=None)
+                            did=did)),
+                    config_entry.entry_id)
                 if not device_entry:
                     _LOGGER.error('remove device not found, %s', did)
                     continue

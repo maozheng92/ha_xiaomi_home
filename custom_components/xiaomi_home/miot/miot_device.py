@@ -1147,7 +1147,8 @@ class MIoTServiceEntity(Entity):
                 piid=prop.iid, value=value)
         except MIoTClientError as e:
             raise RuntimeError(
-                f'{e}, {self.entity_id}, {self.name}, {prop.name}') from e
+                f'{e}, {self.entity_id}, {self.name}, {prop.name}, '
+                f'value={value}') from e
         if update_value:
             self._prop_value_map[prop] = value
         if write_ha_state:

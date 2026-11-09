@@ -101,6 +101,8 @@ class Light(MIoTServiceEntity, LightEntity):
     _prop_color_temp: Optional[MIoTSpecProperty]
     _prop_color: Optional[MIoTSpecProperty]
     _prop_mode: Optional[MIoTSpecProperty]
+    # MIoT name "WY" (white/yellow): the mode that accepts color temperature.
+    _color_temp_mode: Any
 
     _brightness_scale: Optional[tuple[int, int]]
     _mode_map: Optional[dict[Any, Any]]
@@ -121,6 +123,7 @@ class Light(MIoTServiceEntity, LightEntity):
         self._prop_color_temp = None
         self._prop_color = None
         self._prop_mode = None
+        self._color_temp_mode = None
         self._brightness_scale = None
         self._mode_map = None
 
@@ -193,6 +196,11 @@ class Light(MIoTServiceEntity, LightEntity):
                     self._attr_effect_list = list(self._mode_map.values())
                     self._attr_supported_features |= LightEntityFeature.EFFECT
                     self._prop_mode = prop
+                    if prop.value_list:
+                        # Scene modes reject color-temperature writes. WY is
+                        # the spec name for the adjustable color-temp mode.
+                        self._color_temp_mode = (
+                            prop.value_list.get_value_by_name('wy'))
                 else:
                     _LOGGER.info('invalid mode format, %s', self.entity_id)
                     continue
@@ -256,6 +264,20 @@ class Light(MIoTServiceEntity, LightEntity):
             value_on = True if self._prop_on.format_ == bool else 1
             await self.set_property_async(
                 prop=self._prop_on, value=value_on)
+        # Leave a scene mode before writing color temperature. Leishi lights
+        # such as eps125 answer that write with code -4005 while a scene is
+        # active. An explicit effect still wins below.
+        if (
+            ATTR_COLOR_TEMP_KELVIN in kwargs
+            and ATTR_EFFECT not in kwargs
+            and self._color_temp_mode is not None
+            and self.get_prop_value(prop=self._prop_mode)
+            != self._color_temp_mode
+        ):
+            await self.set_property_async(
+                prop=self._prop_mode,
+                value=self._color_temp_mode,
+                write_ha_state=False)
         # brightness
         if ATTR_BRIGHTNESS in kwargs:
             brightness = brightness_to_value(
