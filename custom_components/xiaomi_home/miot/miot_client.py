@@ -60,8 +60,10 @@ from homeassistant.components import zeroconf
 
 # pylint: disable=relative-beyond-top-level
 from .common import (
-    MIoTMatcher, command_still_holds, get_system_info_str, run_control_routes,
-    same_prop_value, should_push_cloud_shadow, slugify_did)
+    MIoTMatcher, command_still_holds, get_system_info_str,
+    idle_on_uses_cloud, order_control_routes, run_control_routes,
+    same_prop_value, should_push_cloud_shadow, slugify_did,
+    switch_on_state, track_switch_off, unix_seconds)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -121,6 +123,14 @@ CLOUD_SHADOW_BACKOFF = 60
 COMMAND_HOLD = 20
 # A sleeping bulb does not answer. Wait before asking it again.
 READ_FAIL_QUIET = 30
+# After two minutes off, the gateway waits out its timer before the
+# cloud can wake the lamp. Turn-on tries the cloud first.
+IDLE_OFF_CLOUD_FIRST = 120
+# The cloud write returns before the gateway cache moves. Read the
+# device once the rest of the turn-on has been sent.
+GATEWAY_CACHE_REFRESH_DELAY = 2.0
+GATEWAY_CACHE_REFRESH_RETRY = 2.0
+GATEWAY_DEVICE_READ_TIMEOUT_MS = 6000
 
 @dataclass
 class MIoTClientSub:
@@ -273,6 +283,11 @@ class MIoTClient:
         self._cloud_mirror_subs: set[str] = set()
         # (did, siid, piid) -> mirrored/fail_at/quiet_until/published
         self._device_watch: dict[tuple, dict] = {}
+        # Light switches seen since startup, and the Unix time they
+        # last turned off. Absent from _switch_off_at means the switch
+        # is on or has not been seen.
+        self._switch_known: set[tuple] = set()
+        self._switch_off_at: dict[tuple, float] = {}
         self._device_poll_timer: Optional[asyncio.TimerHandle] = None
         self._sub_tree = MIoTMatcher()
         self._sub_device_state = {}
@@ -434,6 +449,8 @@ class MIoTClient:
             self._device_poll_timer.cancel()
             self._device_poll_timer = None
         self._device_watch.clear()
+        self._switch_known.clear()
+        self._switch_off_at.clear()
         # Cloud mips
         self._mips_cloud.unsub_mips_state(
             key=f'{self._uid}-{self._cloud_server}')
@@ -749,6 +766,15 @@ class MIoTClient:
                 return None
             routes.append(('cloud', _cloud))
 
+        cloud_ready = any(item[0] == 'cloud' for item in routes)
+        if cloud_ready and await self.__idle_on_cloud_first_async(
+                did, siid, piid, value):
+            off_at = self._switch_off_at.get((did, siid, piid), 0.0)
+            _LOGGER.info(
+                'idle light on, cloud first, %s.%d.%d, off %.0fs',
+                did, siid, piid, time.time() - off_at)
+            routes = order_control_routes(routes, True)
+
         def _on_plan(name: str, rc: int, plan: str) -> None:
             _LOGGER.info(
                 'set prop %s, %s.%d.%d, code=%s, %s',
@@ -767,6 +793,10 @@ class MIoTClient:
                     self.__mirror_watched_prop(did, siid, piid, value))
             else:
                 self.__note_device_write(did, siid, piid, value)
+                if self.__gateway_client(did) is not None:
+                    self._main_loop.create_task(
+                        self.__refresh_gateway_cache_async(
+                            did, siid, piid, value))
             return True
         self.__raise_control_error(did, rc)
 
@@ -1137,17 +1167,21 @@ class MIoTClient:
                 return lan
         return await self.__read_cloud_prop_async(did, siid, piid, datasource=2)
 
-    async def __read_gateway_prop_async(
-        self, did: str, siid: int, piid: int
-    ) -> Any:
+    def __gateway_client(self, did: str) -> Optional[MipsLocalClient]:
         device_gw = self._device_list_gateway.get(did, None)
         if not (
-            device_gw and device_gw.get('online', False)
+            device_gw
+            and device_gw.get('online', False)
             and device_gw.get('specv2_access', False)
             and 'group_id' in device_gw
         ):
             return None
-        mips = self._mips_local.get(device_gw['group_id'], None)
+        return self._mips_local.get(device_gw['group_id'], None)
+
+    async def __read_gateway_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        mips = self.__gateway_client(did)
         if mips is None:
             return None
         try:
@@ -1156,6 +1190,112 @@ class MIoTClient:
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.debug('gateway prop read failed, %s, %s', did, err)
             return None
+
+    async def __read_gateway_device_prop_async(
+        self, did: str, siid: int, piid: int
+    ) -> Any:
+        """Read the bulb through the gateway, not the gateway cache."""
+        mips = self.__gateway_client(did)
+        if mips is None:
+            return None
+        try:
+            return await mips.get_device_prop_async(
+                did=did, siid=siid, piid=piid,
+                timeout_ms=GATEWAY_DEVICE_READ_TIMEOUT_MS)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info('gateway device read failed, %s, %s', did, err)
+            return None
+
+    async def __refresh_gateway_cache_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> None:
+        """Ask the gateway to read the device after a cloud write.
+
+        The cloud command does not update ``proxy/get``. ``get_properties``
+        goes to the bulb. The log shows whether that answer matches the
+        value just written.
+        """
+        try:
+            await asyncio.sleep(GATEWAY_CACHE_REFRESH_DELAY)
+            for attempt in (1, 2):
+                live = await self.__read_gateway_device_prop_async(
+                    did, siid, piid)
+                _LOGGER.info(
+                    'gateway device read after cloud set, %s.%d.%d, '
+                    'attempt %s, %s',
+                    did, siid, piid, attempt, live)
+                if live is not None and same_prop_value(live, value):
+                    return
+                if attempt == 1:
+                    await asyncio.sleep(GATEWAY_CACHE_REFRESH_RETRY)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.info(
+                'gateway device read after cloud set failed, %s, %s',
+                did, err)
+
+    async def __idle_on_cloud_first_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        """Use the cloud when this light has been off for two minutes."""
+        key = (did, siid, piid)
+        if key not in self._device_watch or switch_on_state(value) is not True:
+            return False
+        await self.__ensure_switch_known_async(did, siid, piid)
+        off_at = self._switch_off_at.get(key)
+        return idle_on_uses_cloud(
+            off_at, time.time(), IDLE_OFF_CLOUD_FIRST)
+
+    async def __ensure_switch_known_async(
+        self, did: str, siid: int, piid: int
+    ) -> None:
+        key = (did, siid, piid)
+        if key in self._switch_known or not self._network.network_status:
+            return
+        try:
+            results = await self._http.get_props_async(
+                params=[{'did': did, 'siid': siid, 'piid': piid}],
+                datasource=1)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug('switch age read failed, %s, %s', did, err)
+            return
+        if (
+            not results
+            or not isinstance(results[0], dict)
+            or 'value' not in results[0]
+        ):
+            return
+        self.__note_switch(
+            did, siid, piid, results[0].get('value'),
+            results[0].get('updateTime'))
+
+    def __note_switch(
+        self, did: Any, siid: Any, piid: Any, value: Any,
+        reported_at: Any = None,
+    ) -> None:
+        if (
+            not isinstance(did, str)
+            or isinstance(siid, bool) or not isinstance(siid, int)
+            or isinstance(piid, bool) or not isinstance(piid, int)
+        ):
+            return
+        key = (did, siid, piid)
+        if key not in self._device_watch and key not in self._switch_known:
+            return
+        if switch_on_state(value) is None:
+            return
+        known, off_at = track_switch_off(
+            key in self._switch_known,
+            self._switch_off_at.get(key),
+            value,
+            time.time(),
+            unix_seconds(reported_at))
+        if not known:
+            return
+        self._switch_known.add(key)
+        if off_at is None:
+            self._switch_off_at.pop(key, None)
+        else:
+            self._switch_off_at[key] = off_at
 
     async def __read_lan_prop_async(
         self, did: str, siid: int, piid: int
@@ -1242,6 +1382,7 @@ class MIoTClient:
         state['commanded'] = value
         state['commanded_until'] = now + COMMAND_HOLD
         state['quiet_until'] = now + COMMAND_HOLD
+        self.__note_switch(did, siid, piid, value)
 
     def __drop_stale_command_value(self, params: dict) -> bool:
         """Ignore an old off report while a recent on command is settling."""
@@ -1711,6 +1852,10 @@ class MIoTClient:
         # BLE device has no online/offline msg
         if self.__drop_stale_command_value(params):
             return
+        self.__note_switch(
+            params.get('did'), params.get('siid'), params.get('piid'),
+            params.get('value'),
+            params.get('updateTime', params.get('ts')))
         try:
             subs: list[MIoTClientSub] = list(self._sub_tree.iter_match(
                 f'{params["did"]}/p/{params["siid"]}/{params["piid"]}'))

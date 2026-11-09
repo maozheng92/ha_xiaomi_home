@@ -153,6 +153,69 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 
 
 @pytest.mark.github
+def test_idle_off_turns_the_light_on_through_the_cloud_first():
+    """Two minutes off skips the gateway timer. A fresh off does not."""
+    from miot.common import (
+        idle_on_uses_cloud, order_control_routes, track_switch_off,
+        unix_seconds)
+
+    known, off_at = track_switch_off(False, None, False, 1_000.0, 800.0)
+    assert known is True
+    assert off_at == 800.0
+    # A cache read of the same off must not move the timestamp forward.
+    known, off_at = track_switch_off(known, off_at, 0, 1_100.0, None)
+    assert off_at == 800.0
+    assert idle_on_uses_cloud(off_at, 920.0, 120)
+    assert not idle_on_uses_cloud(off_at, 919.0, 120)
+    known, off_at = track_switch_off(known, off_at, True, 1_200.0, None)
+    assert known is True
+    assert off_at is None
+    assert not idle_on_uses_cloud(off_at, 2_000.0, 120)
+    # Brightness and other values are not the switch.
+    assert track_switch_off(False, None, 40, 1_000.0) == (False, None)
+    assert unix_seconds(1794222062895) == 1794222062.895
+    assert unix_seconds(1794222063) == 1794222063
+
+    names = [
+        item[0] for item in order_control_routes(
+            [('gateway', None), ('lan', None), ('cloud', None)], True)]
+    assert names == ['cloud', 'gateway', 'lan']
+    assert order_control_routes(
+        [('gateway', None), ('lan', None)], False) == [
+            ('gateway', None), ('lan', None)]
+
+
+@pytest.mark.github
+def test_gateway_get_properties_reads_the_device():
+    """proxy/get is the cache. get_properties is the device read."""
+    from miot.common import (
+        gateway_get_properties_rpc, gateway_rpc_prop_value)
+
+    payload = gateway_get_properties_rpc('2032272962', 2, 1, 99)
+    assert payload == {
+        'did': '2032272962',
+        'rpc': {
+            'id': 99,
+            'method': 'get_properties',
+            'params': [{
+                'did': '2032272962', 'siid': 2, 'piid': 1}],
+        },
+    }
+    result = {
+        'result': [{
+            'did': '2032272962', 'siid': 2, 'piid': 1,
+            'code': 0, 'value': False,
+        }]
+    }
+    assert gateway_rpc_prop_value('2032272962', result) is False
+    assert gateway_rpc_prop_value('2032272962', {
+        'result': [{
+            'did': '2032272962', 'code': -9999, 'value': True}]
+    }) is None
+    assert gateway_rpc_prop_value('other', result) is None
+
+
+@pytest.mark.github
 def test_recent_on_command_blocks_a_stale_off_read():
     """A gateway cache of off must not undo the on command just sent."""
     from miot.common import command_still_holds

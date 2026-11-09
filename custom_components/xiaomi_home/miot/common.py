@@ -316,6 +316,107 @@ def same_prop_value(left: Any, right: Any) -> bool:
     return False
 
 
+def switch_on_state(value: Any) -> Optional[bool]:
+    """Return True for on, False for off, and None for any other value.
+
+    A few lights store the switch as 1 and 0 rather than True and False.
+    """
+    if value is True or value == 1:
+        return True
+    if value is False or value == 0:
+        return False
+    return None
+
+
+def unix_seconds(stamp: Any) -> Optional[float]:
+    """Convert a Xiaomi second or millisecond timestamp to Unix seconds."""
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    if stamp <= 0:
+        return None
+    if stamp >= 10_000_000_000:
+        stamp = stamp / 1000.0
+    return float(stamp)
+
+
+def track_switch_off(
+    known: bool,
+    off_at: Optional[float],
+    value: Any,
+    now: float,
+    reported_at: Optional[float] = None,
+) -> tuple[bool, Optional[float]]:
+    """Remember when a switch last turned off.
+
+    ``off_at`` is None while the switch is on. Another report of the
+    same off keeps the earlier timestamp, so a cache read does not look
+    like the lamp just turned off. A value that is not a switch leaves
+    both results unchanged.
+    """
+    state = switch_on_state(value)
+    if state is None:
+        return known, off_at
+    if state:
+        return True, None
+    stamp = now if reported_at is None else reported_at
+    if off_at is None or stamp < off_at:
+        return True, stamp
+    return True, off_at
+
+
+def idle_on_uses_cloud(
+    off_at: Optional[float], now: float, idle: float
+) -> bool:
+    """Turn-on after a long off goes to the cloud before the gateway."""
+    if off_at is None:
+        return False
+    return now - off_at >= idle
+
+
+def order_control_routes(routes: list, cloud_first: bool) -> list:
+    """Move the cloud route ahead of the gateway and LAN."""
+    if not cloud_first:
+        return list(routes)
+    return sorted(routes, key=lambda item: item[0] != 'cloud')
+
+
+def gateway_get_properties_rpc(
+    did: str, siid: int, piid: int, rpc_id: int
+) -> dict:
+    """Build the RPC that makes the gateway read the device.
+
+    ``proxy/get`` returns the gateway cache. ``get_properties`` is sent
+    to the device, so the gateway can replace that cached value.
+    """
+    return {
+        'did': did,
+        'rpc': {
+            'id': rpc_id,
+            'method': 'get_properties',
+            'params': [{
+                'did': did,
+                'siid': siid,
+                'piid': piid,
+            }],
+        },
+    }
+
+
+def gateway_rpc_prop_value(did: str, result: Any) -> Any:
+    """Return the value from one gateway ``get_properties`` result."""
+    if not isinstance(result, dict):
+        return None
+    rows = result.get('result')
+    if not isinstance(rows, list) or len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or row.get('did') != did:
+        return None
+    if row.get('code', 0) not in (0, 1) or 'value' not in row:
+        return None
+    return row.get('value')
+
+
 def command_still_holds(
     commanded: Any, until: float, value: Any, now: float
 ) -> bool:
