@@ -127,6 +127,7 @@
             "-4005": "Özellik değeri hatalı",
             "-4006": "Eylem parametresi hatalı",
             "-4007": "Geçersiz cihaz kimliği",
+            "-9999": "Cihaz yanıt zaman aşımı",
             "-704000000": "Bilinmeyen hata",
             "-704010000": "Yetkisiz (cihaz silinmiş olabilir)",
             "-704014006": "Cihaz açıklaması bulunamadı",

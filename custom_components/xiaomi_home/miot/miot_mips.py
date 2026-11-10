@@ -67,7 +67,9 @@ from paho.mqtt.client import (
     MQTTMessage)
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher
+from .common import (
+    MIoTMatcher, cloud_property_topics, gateway_get_properties_rpc,
+    gateway_rpc_prop_value, iter_cloud_uplink)
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -892,9 +894,7 @@ class MipsCloudClient(_MipsClient):
         if not isinstance(did, str) or handler is None:
             raise MIoTMipsError('invalid params')
 
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
+        topics = cloud_property_topics(did, siid, piid)
 
         def on_prop_msg(topic: str, payload: str, ctx: Any) -> None:
             try:
@@ -903,20 +903,22 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'piid' not in msg['params']
-                or 'value' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'piid', 'value'))
+            if not changes:
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on properties_changed, %s', payload)
-                handler(msg['params'], ctx)
-        return self.__reg_broadcast_external(
-            topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx)
+                for params in changes:
+                    handler(params, ctx)
+        subscribed = False
+        for topic in topics:
+            subscribed = self.__reg_broadcast_external(
+                topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx
+            ) or subscribed
+        return subscribed
 
     @final
     def unsub_prop(
@@ -927,10 +929,10 @@ class MipsCloudClient(_MipsClient):
     ) -> bool:
         if not isinstance(did, str):
             raise MIoTMipsError('invalid params')
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
-        return self.__unreg_broadcast_external(topic=topic)
+        removed = False
+        for topic in cloud_property_topics(did, siid, piid):
+            removed = self.__unreg_broadcast_external(topic=topic) or removed
+        return removed
 
     @final
     def sub_event(
@@ -955,19 +957,18 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'eiid' not in msg['params']
-                or 'arguments' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'eiid', 'arguments'))
+            if not changes:
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on on_event_msg, %s', payload)
-                msg['params']['from'] = 'cloud'
-                handler(msg['params'], ctx)
+                for params in changes:
+                    notified = dict(params)
+                    notified['from'] = 'cloud'
+                    handler(notified, ctx)
         return self.__reg_broadcast_external(
             topic=topic, handler=on_event_msg, handler_ctx=handler_ctx)
 
@@ -1314,6 +1315,19 @@ class MipsLocalClient(_MipsClient):
         if not isinstance(result_obj, dict) or 'value' not in result_obj:
             return None
         return result_obj['value']
+
+    @final
+    async def get_device_prop_async(
+        self, did: str, siid: int, piid: int, timeout_ms: int = 10000
+    ) -> Any:
+        """Read the device. ``get_prop_async`` reads the gateway cache."""
+        payload_obj = gateway_get_properties_rpc(
+            did, siid, piid, self.__gen_mips_id)
+        result_obj = await self.__request_async(
+            topic='proxy/rpcReq',
+            payload=json.dumps(payload_obj),
+            timeout_ms=timeout_ms)
+        return gateway_rpc_prop_value(did, result_obj)
 
     @final
     async def set_prop_async(
