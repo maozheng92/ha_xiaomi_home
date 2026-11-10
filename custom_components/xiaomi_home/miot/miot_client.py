@@ -61,7 +61,7 @@ from homeassistant.components import zeroconf
 # pylint: disable=relative-beyond-top-level
 from .common import (
     MIoTMatcher, command_still_holds, get_system_info_str, run_control_routes,
-    same_prop_value, should_push_cloud_shadow, slugify_did)
+    same_prop_value, slugify_did)
 from .const import (
     DEFAULT_CTRL_MODE, DEFAULT_INTEGRATION_LANGUAGE, DEFAULT_NICK_NAME, DOMAIN,
     MIHOME_CERT_EXPIRE_MARGIN, NETWORK_REFRESH_INTERVAL,
@@ -114,8 +114,6 @@ REFRESH_GATEWAY_DEVICES_DELAY = 3
 DEVICE_TIMEOUT_RETRY_DELAY = 1.0
 # Pushes stop after a long off, so the on property is read from the bulb.
 LOCAL_STATE_POLL_INTERVAL = 8
-# Do not write the cloud shadow again while a failed push is cooling down.
-CLOUD_SHADOW_BACKOFF = 60
 # The gateway cache keeps the old off value after the bulb wakes.
 # Polls and cloud writes of that value are ignored until this ends.
 COMMAND_HOLD = 20
@@ -1114,23 +1112,11 @@ class MIoTClient:
                     'did': did, 'siid': siid, 'piid': piid, 'value': live,
                 },
                 ctx=None)
-        shadow = await self.__read_cloud_cache_async(did, siid, piid)
-        if not should_push_cloud_shadow(
-            live, shadow, state.get('fail_at', 0.0),
-            time.monotonic(), CLOUD_SHADOW_BACKOFF
-        ):
-            return
-        confirmed = await self.__read_device_prop_async(did, siid, piid)
-        if confirmed is None or not same_prop_value(live, confirmed):
-            return
-        if 'commanded' in state and not same_prop_value(
-                state['commanded'], confirmed):
-            return
-        if await self.__write_cloud_shadow_async(
-                did, siid, piid, confirmed):
-            state['fail_at'] = 0.0
-            return
-        state['fail_at'] = time.monotonic()
+        # proxy/get is the gateway cache. After Mi Home turns the lamp
+        # on locally, that cache can still say off while the cloud
+        # shadow says on. Writing the cache back with prop/set updates
+        # the shadow immediately, so the app returns to off, and the
+        # bulb can stay on when the off command never reaches it.
 
     async def __read_device_prop_async(
         self, did: str, siid: int, piid: int
@@ -1206,12 +1192,6 @@ class MIoTClient:
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOGGER.debug('lan prop read failed, %s, %s', did, err)
             return None
-
-    async def __read_cloud_cache_async(
-        self, did: str, siid: int, piid: int
-    ) -> Any:
-        return await self.__read_cloud_prop_async(
-            did, siid, piid, datasource=1)
 
     async def __read_cloud_prop_async(
         self, did: str, siid: int, piid: int, datasource: int

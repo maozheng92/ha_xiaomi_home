@@ -367,23 +367,6 @@ def command_still_holds(
     return not same_prop_value(commanded, value)
 
 
-def should_push_cloud_shadow(
-    live: Any, shadow: Any, fail_at: float, now: float, backoff: float
-) -> bool:
-    """The cloud shadow is what Mi Home shows when the bulb stops reporting.
-
-    Push the live value only when a device read and the cloud cache
-    disagree. A missing cache read is not a disagreement.
-    """
-    if live is None or shadow is None:
-        return False
-    if same_prop_value(live, shadow):
-        return False
-    if fail_at and now - fail_at < backoff:
-        return False
-    return True
-
-
 def did_from_device_topic(topic: str) -> Optional[str]:
     """Return the did encoded in ``device/{did}/up/...``."""
     parts = str(topic).split('/')

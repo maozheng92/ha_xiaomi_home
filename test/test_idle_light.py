@@ -137,19 +137,13 @@ def test_cloud_uplink_fills_did_from_topic():
 
 
 @pytest.mark.github
-def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
-    """Button and Mi Home changes leave the other side on the old value."""
-    from miot.common import same_prop_value, should_push_cloud_shadow
+def test_bool_property_values_match_across_zero_and_one():
+    """Devices report booleans as 0 and 1."""
+    from miot.common import same_prop_value
 
     assert same_prop_value(True, 1)
     assert same_prop_value(False, 0)
     assert not same_prop_value(True, False)
-    assert should_push_cloud_shadow(True, False, 0, 100, 60)
-    assert not should_push_cloud_shadow(True, True, 0, 100, 60)
-    assert not should_push_cloud_shadow(True, 1, 0, 100, 60)
-    assert not should_push_cloud_shadow(True, None, 0, 100, 60)
-    assert not should_push_cloud_shadow(True, False, 80, 100, 60)
-    assert should_push_cloud_shadow(True, False, 30, 100, 60)
 
 
 @pytest.mark.github
