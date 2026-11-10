@@ -353,65 +353,6 @@ def gateway_rpc_prop_value(did: str, result: Any) -> Any:
     return row.get('value')
 
 
-def prop_time_seconds(stamp: Any) -> Optional[float]:
-    """Convert a Xiaomi second or millisecond timestamp to Unix seconds."""
-    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
-        return None
-    if stamp <= 0:
-        return None
-    if stamp >= 10_000_000_000:
-        stamp = float(stamp) / 1000.0
-    return float(stamp)
-
-
-def cloud_mirror_wanted(source: Optional[str], in_cloud: bool) -> bool:
-    """Keep a cloud subscription beside a gateway or LAN subscription.
-
-    The bulb reports on the cloud broker. A sleeping Wi-Fi light stays
-    offline in the cloud device list, and the gateway may not forward
-    that report. The online flag does not decide this subscription.
-    """
-    return in_cloud and source not in (None, 'cloud')
-
-
-def newer_cloud_cache(
-    local: Any, local_ts: Optional[float],
-    cloud: Any, cloud_ts: Optional[float],
-) -> bool:
-    """The cloud cache changed after the gateway or LAN cache.
-
-    A property report, or a cloud prop/set for a light that is not in
-    the gateway local list, moves updateTime. Mi Home does not write
-    the cloud when the light is in that list. Follow the newer cache
-    instead of writing the older off back.
-    """
-    if cloud is None or cloud_ts is None or local_ts is None:
-        return False
-    if same_prop_value(local, cloud):
-        return False
-    return cloud_ts > local_ts
-
-
-def watched_prop_value(
-    device: Any, gateway: Any, gateway_ts: Optional[float],
-    cloud: Any, cloud_ts: Optional[float],
-) -> tuple[Any, str]:
-    """Choose the watched value for a light on the gateway local list.
-
-    Mi Home writes that list only through the gateway and refreshes its
-    own screen from the command. The cloud shadow stays unchanged until
-    ``properties_changed`` or ``properties_changed_v3``. A newer cloud
-    cache is that report. Otherwise the bulb read wins over ``proxy/get``.
-    """
-    if newer_cloud_cache(gateway, gateway_ts, cloud, cloud_ts):
-        return cloud, 'cloud'
-    if device is not None:
-        return device, 'device'
-    if gateway is not None:
-        return gateway, 'gateway'
-    return None, ''
-
-
 def command_still_holds(
     commanded: Any, until: float, value: Any, now: float
 ) -> bool:

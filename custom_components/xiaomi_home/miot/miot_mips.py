@@ -69,7 +69,7 @@ from paho.mqtt.client import (
 # pylint: disable=relative-beyond-top-level
 from .common import (
     MIoTMatcher, cloud_property_topics, gateway_get_properties_rpc,
-    gateway_rpc_prop_value, iter_cloud_uplink, prop_time_seconds)
+    gateway_rpc_prop_value, iter_cloud_uplink)
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -1315,26 +1315,6 @@ class MipsLocalClient(_MipsClient):
         if not isinstance(result_obj, dict) or 'value' not in result_obj:
             return None
         return result_obj['value']
-
-    @final
-    async def get_cached_prop_async(
-        self, did: str, siid: int, piid: int, timeout_ms: int = 10000
-    ) -> Optional[dict]:
-        """Read ``proxy/get``, including the cache timestamp."""
-        result_obj = await self.__request_async(
-            topic='proxy/get',
-            payload=json.dumps({
-                'did': did,
-                'siid': siid,
-                'piid': piid
-            }),
-            timeout_ms=timeout_ms)
-        if not isinstance(result_obj, dict) or 'value' not in result_obj:
-            return None
-        return {
-            'value': result_obj['value'],
-            'ts': prop_time_seconds(result_obj.get('ts')),
-        }
 
     @final
     async def get_device_prop_async(

@@ -153,23 +153,10 @@ def test_cloud_shadow_updates_only_when_the_bulb_disagrees():
 
 
 @pytest.mark.github
-def test_mihome_local_on_comes_from_the_bulb_or_v3_report():
-    """A local-list command does not update the cloud shadow."""
-    from miot.common import (
-        cloud_mirror_wanted, cloud_property_topics, iter_cloud_uplink,
-        prop_time_seconds, watched_prop_value)
+def test_v3_property_report_carries_the_light_state():
+    """Mi Home listens to properties_changed_v3 as well as v1."""
+    from miot.common import cloud_property_topics, iter_cloud_uplink
 
-    gateway_ts = prop_time_seconds(1794222062895)
-    cloud_ts = prop_time_seconds(1794222618)
-    # No report: both caches stay off. The bulb read is the new on.
-    assert watched_prop_value(
-        True, False, gateway_ts, False, gateway_ts) == (True, 'device')
-    # The report reached the cloud cache after the gateway stored off.
-    assert watched_prop_value(
-        False, False, gateway_ts, True, cloud_ts) == (True, 'cloud')
-    # No bulb read yet, and the cloud cache is still the old off.
-    assert watched_prop_value(
-        None, False, gateway_ts, False, gateway_ts) == (False, 'gateway')
     assert cloud_property_topics('2032272962') == (
         'device/2032272962/up/properties_changed/#',
         'device/2032272962/up/properties_changed_v3/#',
@@ -180,12 +167,14 @@ def test_mihome_local_on_comes_from_the_bulb_or_v3_report():
     ) == [{
         'did': '2032272962', 'miid': 0, 'siid': 2, 'piid': 1, 'value': True,
     }]
-    # A sleeping light is offline in the cloud list and still needs
-    # the cloud subscription while the gateway is the primary source.
-    assert cloud_mirror_wanted('group-1', True)
-    assert not cloud_mirror_wanted('cloud', True)
-    assert not cloud_mirror_wanted('group-1', False)
-    assert not cloud_mirror_wanted(None, True)
+    # A payload that already names the property keeps those ids.
+    named = iter_cloud_uplink(
+        topic,
+        {'params': {'siid': 4, 'piid': 1, 'value': False}},
+        ('siid', 'piid', 'value'))
+    assert named[0]['siid'] == 4
+    assert named[0]['piid'] == 1
+    assert named[0]['did'] == '2032272962'
 
 
 @pytest.mark.github
