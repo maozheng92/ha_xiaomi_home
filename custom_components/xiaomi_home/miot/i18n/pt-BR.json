@@ -127,6 +127,7 @@
             "-4005": "Valor da propriedade inválido",
             "-4006": "Parâmetro da ação inválido",
             "-4007": "ID do dispositivo inválido",
+            "-9999": "Tempo limite de resposta do dispositivo",
             "-704000000": "Erro desconhecido",
             "-704010000": "Não autorizado (o dispositivo pode ter sido excluído)",
             "-704014006": "Descrição do dispositivo não encontrada",

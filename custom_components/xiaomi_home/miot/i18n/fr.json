@@ -127,6 +127,7 @@
             "-4005": "Valeur de propriété incorrecte",
             "-4006": "Paramètre d'action incorrect",
             "-4007": "ID d'appareil incorrect",
+            "-9999": "Délai de réponse de l'appareil dépassé",
             "-704000000": "Erreur inconnue",
             "-704010000": "Non autorisé (l'appareil peut avoir été supprimé)",
             "-704014006": "Description de l'appareil introuvable",

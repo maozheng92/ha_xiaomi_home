@@ -941,6 +941,11 @@ class MIoTDevice:
                     handler, key, state)
 
 
+# Cloud property cache lags a write whose acknowledgement was lost.
+# Read again after the device has reported the new value.
+_FAILED_WRITE_RESYNC_DELAY = 5
+
+
 class MIoTServiceEntity(Entity):
     """MIoT Service Entity."""
     # pylint: disable=unused-argument
@@ -959,6 +964,8 @@ class MIoTServiceEntity(Entity):
         MIoTSpecProperty, Callable[[MIoTSpecProperty, Any], None]]
 
     _pending_write_ha_state_timer: Optional[asyncio.TimerHandle]
+    _resync_timer: Optional[asyncio.TimerHandle]
+    _resync_prop: Optional[MIoTSpecProperty]
 
     def __init__(
         self, miot_device: MIoTDevice, entity_data: MIoTEntityData
@@ -1005,6 +1012,8 @@ class MIoTServiceEntity(Entity):
         self._event_occurred_handler = None
         self._prop_changed_subs = {}
         self._pending_write_ha_state_timer = None
+        self._resync_timer = None
+        self._resync_prop = None
         _LOGGER.info(
             'new miot service entity, %s, %s, %s, %s',
             self.miot_device.name, self._attr_name, self.entity_data.spec.name,
@@ -1066,6 +1075,9 @@ class MIoTServiceEntity(Entity):
         if self._pending_write_ha_state_timer:
             self._pending_write_ha_state_timer.cancel()
             self._pending_write_ha_state_timer = None
+        if self._resync_timer:
+            self._resync_timer.cancel()
+            self._resync_timer = None
         state_id = 's.0'
         if isinstance(self.entity_data.spec, MIoTSpecService):
             state_id = f's.{self.entity_data.spec.iid}'
@@ -1146,6 +1158,7 @@ class MIoTServiceEntity(Entity):
                 did=self.miot_device.did, siid=prop.service.iid,
                 piid=prop.iid, value=value)
         except MIoTClientError as e:
+            self.__schedule_failed_write_resync(prop)
             raise RuntimeError(
                 f'{e}, {self.entity_id}, {self.name}, {prop.name}, '
                 f'value={value}') from e
@@ -1260,6 +1273,37 @@ class MIoTServiceEntity(Entity):
         self._pending_write_ha_state_timer = None
         self.async_write_ha_state()
 
+    def __schedule_failed_write_resync(
+        self, prop: MIoTSpecProperty
+    ) -> None:
+        """Read the bulb after a command it did not accept.
+
+        The first attempt after a long off leaves the bulb unchanged.
+        The cloud cache is stale too, so the value has to come from the
+        bulb. A later read catches a command that lands late.
+        """
+        self._resync_prop = prop
+        self.__read_device_prop(prop)
+        if self._resync_timer:
+            self._resync_timer.cancel()
+        self._resync_timer = self._main_loop.call_later(
+            _FAILED_WRITE_RESYNC_DELAY, self.__failed_write_resync)
+
+    def __failed_write_resync(self) -> None:
+        self._resync_timer = None
+        prop = getattr(self, '_resync_prop', None)
+        if prop is not None:
+            self.__read_device_prop(prop)
+
+    def __read_device_prop(self, prop: MIoTSpecProperty) -> None:
+        try:
+            self.miot_device.miot_client.request_device_sync(
+                did=self.miot_device.did,
+                siid=prop.service.iid,
+                piid=prop.iid)
+        except MIoTClientError as err:
+            _LOGGER.debug('resync after failed write, %s', err)
+
 
 class MIoTPropertyEntity(Entity):
     """MIoT Property Entity."""
@@ -1278,6 +1322,7 @@ class MIoTPropertyEntity(Entity):
     _value_sub_id: int
 
     _pending_write_ha_state_timer: Optional[asyncio.TimerHandle]
+    _resync_timer: Optional[asyncio.TimerHandle]
 
     def __init__(self, miot_device: MIoTDevice, spec: MIoTSpecProperty) -> None:
         if miot_device is None or spec is None or spec.service is None:
@@ -1292,6 +1337,7 @@ class MIoTPropertyEntity(Entity):
         self._state_sub_id = 0
         self._value_sub_id = 0
         self._pending_write_ha_state_timer = None
+        self._resync_timer = None
         # Gen entity_id
         # The unique_id keeps the integration domain, see MIoTServiceEntity
         self._attr_unique_id = self.miot_device.gen_prop_entity_id(
@@ -1335,6 +1381,9 @@ class MIoTPropertyEntity(Entity):
         if self._pending_write_ha_state_timer:
             self._pending_write_ha_state_timer.cancel()
             self._pending_write_ha_state_timer = None
+        if self._resync_timer:
+            self._resync_timer.cancel()
+            self._resync_timer = None
         self.miot_device.unsub_device_state(
             key=f'{ self.service.iid}.{self.spec.iid}',
             sub_id=self._state_sub_id)
@@ -1364,6 +1413,7 @@ class MIoTPropertyEntity(Entity):
                 did=self.miot_device.did, siid=self.spec.service.iid,
                 piid=self.spec.iid, value=value)
         except MIoTClientError as e:
+            self.__schedule_failed_write_resync()
             raise RuntimeError(
                 f'{e}, {self.entity_id}, {self.name}') from e
         self._value = value
@@ -1415,6 +1465,26 @@ class MIoTPropertyEntity(Entity):
     def __write_ha_state_handler(self) -> None:
         self._pending_write_ha_state_timer = None
         self.async_write_ha_state()
+
+    def __schedule_failed_write_resync(self) -> None:
+        self.__read_device_prop()
+        if self._resync_timer:
+            self._resync_timer.cancel()
+        self._resync_timer = self._main_loop.call_later(
+            _FAILED_WRITE_RESYNC_DELAY, self.__failed_write_resync)
+
+    def __failed_write_resync(self) -> None:
+        self._resync_timer = None
+        self.__read_device_prop()
+
+    def __read_device_prop(self) -> None:
+        try:
+            self.miot_device.miot_client.request_device_sync(
+                did=self.miot_device.did,
+                siid=self.service.iid,
+                piid=self.spec.iid)
+        except MIoTClientError as err:
+            _LOGGER.debug('resync after failed write, %s', err)
 
 
 class MIoTEventEntity(Entity):

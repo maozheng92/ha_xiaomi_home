@@ -127,6 +127,7 @@
             "-4005": "Ongeldige eigenschapswaarde",
             "-4006": "Ongeldige actieparameter",
             "-4007": "Ongeldige apparaat-ID",
+            "-9999": "Time-out van apparaatantwoord",
             "-704000000": "Onbekende fout",
             "-704010000": "Niet geautoriseerd (apparaat kan zijn verwijderd)",
             "-704014006": "Apparaatbeschrijving niet gevonden",

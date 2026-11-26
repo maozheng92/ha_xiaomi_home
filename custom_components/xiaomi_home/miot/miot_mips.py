@@ -61,13 +61,16 @@ from typing import Any, Callable, Optional, final, Coroutine
 from paho.mqtt.client import (
     MQTT_ERR_SUCCESS,
     MQTT_ERR_NO_CONN,
+    MQTT_ERR_CONN_LOST,
     MQTT_ERR_UNKNOWN,
     Client,
     MQTTv5,
     MQTTMessage)
 
 # pylint: disable=relative-beyond-top-level
-from .common import MIoTMatcher
+from .common import (
+    MIoTMatcher, call_soon_if_open, cloud_property_topics,
+    gateway_get_properties_rpc, gateway_rpc_prop_value, iter_cloud_uplink)
 from .const import (
     UNSUPPORTED_MODELS,
     MIHOME_MQTT_KEEPALIVE,
@@ -341,10 +344,11 @@ class _MipsClient(ABC):
         """mips disconnect."""
         if not self._mips_thread:
             return
-        self._internal_loop.call_soon_threadsafe(self.__mips_disconnect)
+        call_soon_if_open(self._internal_loop, self.__mips_disconnect)
         self._mips_thread.join()
         self._mips_thread = None
-        self._internal_loop.close()
+        if not self._internal_loop.is_closed():
+            self._internal_loop.close()
 
     async def disconnect_async(self) -> None:
         """mips disconnect async."""
@@ -677,7 +681,11 @@ class _MipsClient(ABC):
 
     def __on_disconnect(self,  client, user_data, rc, props) -> None:
         if self._mqtt_state:
-            (self.log_info if rc == 0 else self.log_error)(
+            # A lost connection is followed by a reconnect. Other codes
+            # stay visible because the client does not recover them.
+            code = getattr(rc, 'value', rc)
+            recovered = code in (0, MQTT_ERR_CONN_LOST)
+            (self.log_info if recovered else self.log_error)(
                 f'mips disconnect, {rc}, {props}')
             self._mqtt_state = False
             if self._mqtt_timer:
@@ -808,7 +816,7 @@ class _MipsClient(ABC):
         interval: float = 0
         if not immediately:
             interval = self.__get_next_reconnect_time()
-            self.log_error(
+            self.log_info(
                 'mips try reconnect after %ss', interval)
         self._mips_reconnect_timer = self._internal_loop.call_later(
             interval, self.__mips_connect)
@@ -892,9 +900,7 @@ class MipsCloudClient(_MipsClient):
         if not isinstance(did, str) or handler is None:
             raise MIoTMipsError('invalid params')
 
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
+        topics = cloud_property_topics(did, siid, piid)
 
         def on_prop_msg(topic: str, payload: str, ctx: Any) -> None:
             try:
@@ -903,20 +909,22 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'piid' not in msg['params']
-                or 'value' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'piid', 'value'))
+            if not changes:
                 self.log_error(
                     f'on_prop_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on properties_changed, %s', payload)
-                handler(msg['params'], ctx)
-        return self.__reg_broadcast_external(
-            topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx)
+                for params in changes:
+                    handler(params, ctx)
+        subscribed = False
+        for topic in topics:
+            subscribed = self.__reg_broadcast_external(
+                topic=topic, handler=on_prop_msg, handler_ctx=handler_ctx
+            ) or subscribed
+        return subscribed
 
     @final
     def unsub_prop(
@@ -927,10 +935,10 @@ class MipsCloudClient(_MipsClient):
     ) -> bool:
         if not isinstance(did, str):
             raise MIoTMipsError('invalid params')
-        topic: str = (
-            f'device/{did}/up/properties_changed/'
-            f'{"#" if siid is None or piid is None else f"{siid}/{piid}"}')
-        return self.__unreg_broadcast_external(topic=topic)
+        removed = False
+        for topic in cloud_property_topics(did, siid, piid):
+            removed = self.__unreg_broadcast_external(topic=topic) or removed
+        return removed
 
     @final
     def sub_event(
@@ -955,19 +963,18 @@ class MipsCloudClient(_MipsClient):
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
-            if (
-                not isinstance(msg.get('params', None), dict)
-                or 'siid' not in msg['params']
-                or 'eiid' not in msg['params']
-                or 'arguments' not in msg['params']
-            ):
+            changes = iter_cloud_uplink(
+                topic, msg, ('siid', 'eiid', 'arguments'))
+            if not changes:
                 self.log_error(
                     f'on_event_msg, invalid msg, {topic}, {payload}')
                 return
             if handler:
                 self.log_debug('on on_event_msg, %s', payload)
-                msg['params']['from'] = 'cloud'
-                handler(msg['params'], ctx)
+                for params in changes:
+                    notified = dict(params)
+                    notified['from'] = 'cloud'
+                    handler(notified, ctx)
         return self.__reg_broadcast_external(
             topic=topic, handler=on_event_msg, handler_ctx=handler_ctx)
 
@@ -1055,14 +1062,13 @@ class MipsCloudClient(_MipsClient):
         self, topic: str, handler: Callable[[str, str, Any], None],
         handler_ctx: Any = None
     ) -> bool:
-        self._internal_loop.call_soon_threadsafe(
+        return call_soon_if_open(
+            self._internal_loop,
             self.__reg_broadcast, topic, handler, handler_ctx)
-        return True
 
     def __unreg_broadcast_external(self, topic: str) -> bool:
-        self._internal_loop.call_soon_threadsafe(
-            self.__unreg_broadcast, topic)
-        return True
+        return call_soon_if_open(
+            self._internal_loop, self.__unreg_broadcast, topic)
 
     def __reg_broadcast(
         self, topic: str, handler: Callable[[str, str, Any], None],
@@ -1316,6 +1322,19 @@ class MipsLocalClient(_MipsClient):
         return result_obj['value']
 
     @final
+    async def get_device_prop_async(
+        self, did: str, siid: int, piid: int, timeout_ms: int = 10000
+    ) -> Any:
+        """Read the device. ``get_prop_async`` reads the gateway cache."""
+        payload_obj = gateway_get_properties_rpc(
+            did, siid, piid, self.__gen_mips_id)
+        result_obj = await self.__request_async(
+            topic='proxy/rpcReq',
+            payload=json.dumps(payload_obj),
+            timeout_ms=timeout_ms)
+        return gateway_rpc_prop_value(did, result_obj)
+
+    @final
     async def set_prop_async(
         self, did: str, siid: int, piid: int, value: Any,
         timeout_ms: int = 10000
@@ -1474,7 +1493,10 @@ class MipsLocalClient(_MipsClient):
             f'{payload}')
 
         def on_request_timeout(req: _MipsRequest):
-            self.log_error(
+            # A cache read timing out is handled by the caller. A command
+            # timeout is the failure the log is meant to show.
+            log = self.log_debug if topic == 'proxy/get' else self.log_error
+            log(
                 f'on mips request timeout, {req.mid}, {pub_topic}'
                 f', {payload}')
             self._request_map.pop(str(req.mid), None)
@@ -1605,23 +1627,22 @@ class MipsLocalClient(_MipsClient):
     ) -> bool:
         if topic is None or payload is None or on_reply is None:
             raise MIoTMipsError('invalid params')
-        self._internal_loop.call_soon_threadsafe(
+        return call_soon_if_open(
+            self._internal_loop,
             self.__request, topic, payload, on_reply, on_reply_ctx, timeout_ms)
-        return True
 
     def __reg_broadcast_external(
         self, topic: str, handler: Callable[[str, str, Any], None],
         handler_ctx: Any
     ) -> bool:
-        self._internal_loop.call_soon_threadsafe(
+        return call_soon_if_open(
+            self._internal_loop,
             self.__reg_broadcast,
             topic, handler, handler_ctx)
-        return True
 
     def __unreg_broadcast_external(self, topic) -> bool:
-        self._internal_loop.call_soon_threadsafe(
-            self.__unreg_broadcast, topic)
-        return True
+        return call_soon_if_open(
+            self._internal_loop, self.__unreg_broadcast, topic)
 
     @final
     async def __request_async(

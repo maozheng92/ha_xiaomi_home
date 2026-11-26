@@ -741,15 +741,20 @@ class MIoTHttpClient:
             'devices': devices
         }
 
-    async def get_props_async(self, params: list) -> list:
+    async def get_props_async(
+        self, params: list, datasource: int = 1
+    ) -> list:
         """
         params = [{"did": "xxxx", "siid": 2, "piid": 1},
                     {"did": "xxxxxx", "siid": 2, "piid": 2}]
+
+        datasource 1 reads the cloud cache. datasource 2 asks the device.
+        The cache stays stale after the device stops publishing.
         """
         res_obj = await self.__mihome_api_post_async(
             url_path='/app/v2/miotspec/prop/get',
             data={
-                'datasource': 1,
+                'datasource': datasource,
                 'params': params
             },
         )

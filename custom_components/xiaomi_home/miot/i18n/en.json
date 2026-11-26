@@ -127,6 +127,7 @@
             "-4005": "Property value error",
             "-4006": "Action parameter error",
             "-4007": "Invalid device ID",
+            "-9999": "Device response timeout",
             "-704000000": "Unknown error",
             "-704010000": "Unauthorized (device may have been deleted)",
             "-704014006": "Device description not found",
