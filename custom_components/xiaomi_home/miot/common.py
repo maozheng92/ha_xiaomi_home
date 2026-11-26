@@ -367,6 +367,23 @@ def command_still_holds(
     return not same_prop_value(commanded, value)
 
 
+def call_soon_if_open(loop: Any, callback: Callable, *args: Any) -> bool:
+    """Schedule callback on loop.
+
+    Shutdown closes the MIPS loop before Home Assistant finishes the
+    disconnect task. Scheduling on that loop is skipped.
+    """
+    if loop is None or loop.is_closed():
+        return False
+    try:
+        loop.call_soon_threadsafe(callback, *args)
+    except RuntimeError as err:
+        if 'closed' not in str(err):
+            raise
+        return False
+    return True
+
+
 def did_from_device_topic(topic: str) -> Optional[str]:
     """Return the did encoded in ``device/{did}/up/...``."""
     parts = str(topic).split('/')

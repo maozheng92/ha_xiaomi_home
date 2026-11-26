@@ -147,6 +147,17 @@ def test_bool_property_values_match_across_zero_and_one():
 
 
 @pytest.mark.github
+def test_closed_mips_loop_is_not_scheduled():
+    """Shutdown closes the MIPS loop before the disconnect task runs."""
+    from miot.common import call_soon_if_open
+
+    loop = asyncio.new_event_loop()
+    loop.close()
+    assert call_soon_if_open(loop, lambda: None) is False
+    assert call_soon_if_open(None, lambda: None) is False
+
+
+@pytest.mark.github
 def test_v3_property_report_carries_the_light_state():
     """Mi Home listens to properties_changed_v3 as well as v1."""
     from miot.common import cloud_property_topics, iter_cloud_uplink
